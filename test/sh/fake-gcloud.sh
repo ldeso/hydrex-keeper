@@ -32,12 +32,12 @@ case "$FAKE_GCLOUD_SCENARIO" in
 esac
 
 job_json() {
-  if [ "$drift" = yes ]; then
+  if [ "$drift" = yes ]; then # deployed by an older version, which set VOTE_OFFSETS
     sa=123456789-compute@developer.gserviceaccount.com retries=0
-    env='{"name":"MODULE","value":"'$module'"},{"name":"KMS_KEY_VERSION","value":"'$key'"}'
+    env='{"name":"MODULE","value":"'$module'"},{"name":"KMS_KEY_VERSION","value":"'$key'"},{"name":"VOTE_OFFSETS","value":"86400"}'
   else
     sa=$keeper_sa retries=3
-    env='{"name":"MODULE","value":"'$module'"},{"name":"KMS_KEY_VERSION","value":"'$key'"},{"name":"VOTE_OFFSETS","value":"86400,600,200,70,25,10,5"}'
+    env='{"name":"MODULE","value":"'$module'"},{"name":"KMS_KEY_VERSION","value":"'$key'"}'
   fi
   secrets='{"name":"BASE_RPC_URLS","valueFrom":{"secretKeyRef":{"key":"latest","name":"base-rpc-url"}}},{"name":"ALCHEMY_API_KEY","valueFrom":{"secretKeyRef":{"key":"latest","name":"alchemy-api-key"}}}'
   printf '{"spec":{"template":{"spec":{"taskCount":1,"template":{"spec":{"containers":[{"env":[%s,%s],"image":"%s-docker.pkg.dev/%s/cloud-run-source-deploy/%s@sha256:0"}],"maxRetries":%s,"serviceAccountName":"%s","timeoutSeconds":"5400"}}}}}}\n' \
@@ -46,9 +46,9 @@ job_json() {
 
 # scheduler_json NAME
 scheduler_json() {
-  case "$1" in "$job-1") cron='50 23 * * 2' ;; *) cron='40 23 * * 3' ;; esac
-  if [ "$drift" = yes ] && [ "$1" = "$job-2" ]; then state=PAUSED; else state=ENABLED; fi
-  if [ "$drift" = yes ] && [ "$1" = "$job-1" ]; then # Cloud Scheduler's defaults: no retry
+  cron='50 23 * * 2,3'
+  if [ "$drift" = yes ]; then state=PAUSED; else state=ENABLED; fi
+  if [ "$drift" = yes ]; then # Cloud Scheduler's defaults: no retry
     retry='{"maxBackoffDuration":"3600s","maxDoublings":5,"maxRetryDuration":"0s","minBackoffDuration":"5s"}'
   else
     retry='{"maxBackoffDuration":"60s","maxDoublings":2,"maxRetryDuration":"300s","minBackoffDuration":"15s","retryCount":3}'
@@ -96,7 +96,7 @@ alert_json() {
 }
 
 start_alert_json() {
-  filter="resource.type=\"cloud_scheduler_job\" AND resource.labels.job_id=~\"^$job-[0-9]+\$\" AND jsonPayload.@type=\"type.googleapis.com/google.cloud.scheduler.logging.AttemptFinished\" AND (severity>=ERROR OR httpRequest.status>=400)"
+  filter="resource.type=\"cloud_scheduler_job\" AND resource.labels.job_id=\"$job\" AND jsonPayload.@type=\"type.googleapis.com/google.cloud.scheduler.logging.AttemptFinished\" AND (severity>=ERROR OR httpRequest.status>=400)"
   [ "$drift" = no ] || filter='resource.type="cloud_scheduler_job"' # edited by hand
   jq -nc --arg name "$job start failed" --arg filter "$filter" --arg channel "$channel" --arg project "$project" \
     '{displayName: $name, enabled: true, name: "projects/\($project)/alertPolicies/2", notificationChannels: [$channel], conditions: [{conditionMatchedLog: {filter: $filter}}]}'
@@ -239,8 +239,8 @@ case "$*" in
       exit 1
     }
     names=''
-    [ "$has_scheduler" = no ] || names="\"projects/$project/locations/$region/jobs/$job-1\",\"projects/$project/locations/$region/jobs/$job-2\""
-    [ "$drift" = no ] || names="$names,\"projects/$project/locations/$region/jobs/$job-3\",\"projects/$project/locations/$region/jobs/other-job\""
+    [ "$has_scheduler" = no ] || names="\"projects/$project/locations/$region/jobs/$job\""
+    [ "$drift" = no ] || names="$names,\"projects/$project/locations/$region/jobs/$job-1\",\"projects/$project/locations/$region/jobs/other-job\""
     printf '[%s]\n' "$(printf '%s' "$names" | sed 's/"\([^"]*\)"/{"name":"\1"}/g')"
     ;;
   "projects get-iam-policy "*)

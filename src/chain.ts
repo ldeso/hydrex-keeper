@@ -75,7 +75,8 @@ export function hedged(rpcUrls: string[]): Transport {
  * hash once one accepts it or already has it; the other answers are logged. Rejects if none does before `until` (ms).
  */
 export function broadcaster(rpcUrls: string[]) {
-  const nodes = rpcUrls.map((url) => ({ host: hostOf(url), transport: transportOf(url) }));
+  // Unbatched, so that a vote does not wait for reads sent to the same URL.
+  const nodes = rpcUrls.map((url) => ({ host: hostOf(url), transport: http(url) }));
   return (signed: Hex, until: number): Promise<Hex> => {
     const hash = keccak256(signed);
     const timeout = Math.max(1, Math.min(TIMEOUT_MS, until - Date.now()));
@@ -142,28 +143,25 @@ export function voterCall({ voter }: Chain, functionName: string, args: readonly
   return { address: voter, abi: voterAbi, functionName, args };
 }
 
-type ReadOptions = { blockNumber?: bigint; lenient?: boolean };
+type ReadOptions = { blockNumber?: bigint; blockTag?: "pending" | undefined };
 
 /**
  * One eth_call per CHUNK calls, sent in parallel, so that a read comes from one block and public nodes see few
- * requests. Every call must succeed unless `lenient`, which yields `undefined` for failures.
+ * requests. Every call must succeed.
  */
 export async function readMany<T>(
   client: Client,
   calls: readonly Call[],
-  { blockNumber, lenient = false }: ReadOptions = {},
+  { blockNumber, blockTag }: ReadOptions = {},
 ): Promise<T[]> {
-  const at = blockNumber === undefined ? {} : { blockNumber };
+  const at = blockNumber !== undefined ? { blockNumber } : blockTag ? { blockTag } : {};
   const chunks = Array.from({ length: Math.ceil(calls.length / CHUNK) }, (_, i) =>
     calls.slice(i * CHUNK, (i + 1) * CHUNK),
   );
   const results = await Promise.all(
     chunks.map((contracts) =>
-      client.multicall({ contracts: contracts as never, allowFailure: lenient, batchSize: 0, ...at }),
+      client.multicall({ contracts: contracts as never, allowFailure: false, batchSize: 0, ...at }),
     ),
   );
-  if (!lenient) return results.flat() as T[];
-  const settled = results.flat() as { status: string; result?: unknown; error?: unknown }[];
-  if (settled.length && settled.every((r) => r.status === "failure")) throw settled[0]!.error;
-  return settled.map((r) => (r.status === "success" ? r.result : undefined)) as T[];
+  return results.flat() as T[];
 }
