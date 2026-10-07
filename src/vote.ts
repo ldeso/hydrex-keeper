@@ -145,7 +145,7 @@ export async function castVote(
   const timeout = Math.max(1, Math.min(RECEIPT_TIMEOUT_MS, until - Date.now()));
   let receipt;
   try {
-    receipt = await chain.client.waitForTransactionReceipt({ hash, timeout });
+    receipt = await chain.client.waitForTransactionReceipt({ hash, timeout, confirmations: 2 });
   } catch (error) {
     if (!(error instanceof WaitForTransactionReceiptTimeoutError)) {
       throw new VoteSent(`vote ${hash}: outcome unknown: ${errorMessage(error)}`);
