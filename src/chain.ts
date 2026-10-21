@@ -22,6 +22,7 @@ export const CHUNK = 1_000; // calls per eth_call: publicnode takes 1,132 and re
 export const HEDGE_DELAY_MS = 250; // a healthy provider answers a pass's read in about 125 ms
 const TIMEOUT_MS = 5_000;
 const BULK_TIMEOUT_MS = 30_000;
+const BLOCK_SECONDS = 2n; // on Base
 
 export const now = () => BigInt(Math.floor(Date.now() / 1000));
 
@@ -131,33 +132,52 @@ export type Chain = {
   client: Client;
   /** For heavy reads, which take seconds: they go to one URL at a time instead of being hedged. */
   bulk: Client;
+  /**
+   * Like `client`, with batches and hedging of its own, for the immutable conduit's votes: the calls one client sends
+   * at once share a JSON-RPC batch, which answers when its slowest call does.
+   */
+  v2Client: Client;
   broadcast: ReturnType<typeof broadcaster>;
   module: Address;
   conduit: Address;
   keeper: Address;
   voter: Address;
   ve: Address;
+  /** The immutable conduit the job also votes for, if any; see connectV2. */
+  v2?: V2 | undefined;
 };
+
+/** The immutable conduit, the address that signs its votes, and the tokens it prices with Chainlink. */
+export type V2 = { conduit: Address; proposer: Address; priced: Address[] };
 
 export async function connect(module: Address, rpcUrls: string[]): Promise<Chain> {
   const client = makeClient(hedged(rpcUrls));
   const [conduit, keeper] = (await readMany<Address>(client, [
-    { address: module, abi: moduleAbi, functionName: "CONDUIT" },
-    { address: module, abi: moduleAbi, functionName: "KEEPER" },
+    call(module, moduleAbi, "CONDUIT"),
+    call(module, moduleAbi, "KEEPER"),
   ])) as [Address, Address];
   const [voter, ve] = (await readMany<Address>(client, [
-    { address: conduit, abi: conduitAbi, functionName: "voter" },
-    { address: conduit, abi: conduitAbi, functionName: "veToken" },
+    call(conduit, conduitAbi, "voter"),
+    call(conduit, conduitAbi, "veToken"),
   ])) as [Address, Address];
   const bulk = makeClient(bulkTransport(rpcUrls));
-  return { client, bulk, broadcast: broadcaster(rpcUrls), module, conduit, keeper, voter, ve };
+  const v2Client = makeClient(hedged(rpcUrls));
+  return { client, bulk, v2Client, broadcast: broadcaster(rpcUrls), module, conduit, keeper, voter, ve };
 }
 
 export type Call = { address: Address; abi: readonly unknown[]; functionName: string; args?: readonly unknown[] };
 
-export function voterCall({ voter }: Chain, functionName: string, args: readonly unknown[] = []): Call {
-  return { address: voter, abi: voterAbi, functionName, args };
+export function call(
+  address: Address,
+  abi: readonly unknown[],
+  functionName: string,
+  args: readonly unknown[] = [],
+): Call {
+  return { address, abi, functionName, args };
 }
+
+export const voterCall = ({ voter }: Chain, functionName: string, args?: readonly unknown[]) =>
+  call(voter, voterAbi, functionName, args);
 
 type ReadOptions = {
   blockNumber?: bigint;
@@ -197,6 +217,42 @@ const reverted = (error: unknown, { address }: Call) =>
   error.contractAddress !== undefined &&
   isAddressEqual(error.contractAddress, address) &&
   error.walk((e) => e instanceof ContractFunctionRevertedError) !== null;
+
+/**
+ * The number of the last block before `time` (s): estimated from the latest block, then checked with the block after
+ * it. If the estimate is off, as when the block time changes, steps that double from it bracket the block, and halving
+ * them finds it.
+ */
+export async function lastBlockBefore(client: Client, time: bigint): Promise<bigint> {
+  const head = await client.getBlock();
+  if (head.timestamp < time) throw new Error(`the latest block, at ${head.timestamp}, is not past ${time} yet`);
+  const before = async (blockNumber: bigint) => (await client.getBlock({ blockNumber })).timestamp < time;
+  const estimate = head.number - (head.timestamp - time) / BLOCK_SECONDS - 1n;
+  // `lo` is before `time`, and `hi` is not: the head is not.
+  let lo = estimate < 0n ? 0n : estimate < head.number ? estimate : head.number - 1n;
+  let hi = lo + 1n;
+  const [loBefore, hiBefore] = await Promise.all([before(lo), before(hi)]);
+  if (!loBefore) {
+    for (let step = 1n; ; step *= 2n) {
+      hi = lo;
+      lo = hi > step ? hi - step : 0n;
+      if (await before(lo)) break;
+      if (lo === 0n) throw new Error(`no block before ${time}`);
+    }
+  } else if (hiBefore) {
+    for (let step = 1n; ; step *= 2n) {
+      lo = hi;
+      hi = lo + step < head.number ? lo + step : head.number;
+      if (!(await before(hi))) break;
+    }
+  }
+  while (hi - lo > 1n) {
+    const mid = (lo + hi) / 2n;
+    if (await before(mid)) lo = mid;
+    else hi = mid;
+  }
+  return lo;
+}
 
 async function multicall(
   client: Client,

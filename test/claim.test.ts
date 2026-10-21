@@ -8,16 +8,18 @@ import {
   encodeAbiParameters,
   encodeEventTopics,
   getAddress,
+  isAddressEqual,
   keccak256,
   parseAbiParameters,
   parseTransaction,
+  recoverTransactionAddress,
   type Address,
   type BaseError,
   type Hex,
   type LocalAccount,
 } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
-import { conduitAbi, moduleAbi, veAbi } from "../src/abi.ts";
+import { conduitAbi, immutableAbi, moduleAbi, veAbi } from "../src/abi.ts";
 import type { Chain, Client } from "../src/chain.ts";
 import {
   claims,
@@ -34,6 +36,7 @@ import type { Run } from "../src/pass.ts";
 const addr = (n: number) => getAddress(`0x${n.toString(16).padStart(40, "0")}`);
 const [MODULE, CONDUIT, VOTER, VE] = [addr(1), addr(2), addr(3), addr(4)];
 const [ROUTER, AGGREGATOR, CREDIT, CLASS] = [addr(5), addr(6), addr(7), addr(8)];
+const V2 = addr(10);
 const [I1, E1, I2, E2] = [addr(15), addr(16), addr(17), addr(18)];
 const USDC: Address = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 const KVCM: Address = "0x00fBAC94Fec8D4089d3fe979F39454F48c71A65d";
@@ -46,6 +49,7 @@ const ODD = [addr(91), addr(92), addr(93), addr(94), addr(95)];
 const [OWNER, SMALL, OTHER] = [addr(21), addr(22), addr(23)];
 const FOUNDATION: Address = "0xa79cd47655156b299762DFE92A67980805ce5a31";
 const signer = privateKeyToAccount(generatePrivateKey());
+const proposer = privateKeyToAccount(generatePrivateKey());
 
 const WEEK = 604_800n;
 const START = 1_792_022_400n; // the epoch that just began
@@ -57,11 +61,21 @@ const usdc = (dollars: number) => BigInt(dollars * 1_000_000);
 
 /**
  * veNFT 1 is delegated elsewhere. 2 is OWNER's, 3 the Klima Foundation's, and 4 SMALL's, with $1 to claim. 5 is burned,
- * and 6 has not allowed the conduit to claim for it.
+ * and 6 has not allowed the conduit to claim for it. 7, the Klima Foundation's, and 8, OWNER's, are delegated to the
+ * immutable conduit.
  */
-const owners: Record<string, Address> = { 1: OTHER, 2: OWNER, 3: FOUNDATION, 4: SMALL, 6: OTHER };
-const powers: Record<string, bigint> = { 1: 7n, 2: 100n, 3: 800n, 4: 1n, 5: 99n, 6: 10n };
+const owners: Record<string, Address> = {
+  1: OTHER,
+  2: OWNER,
+  3: FOUNDATION,
+  4: SMALL,
+  6: OTHER,
+  7: FOUNDATION,
+  8: OWNER,
+};
+const powers: Record<string, bigint> = { 1: 7n, 2: 100n, 3: 800n, 4: 1n, 5: 99n, 6: 10n, 7: 300n, 8: 20n };
 const unapproved = new Set(["6"]);
+const delegateOf = (id: unknown): Address => ({ 1: OTHER, 7: V2, 8: V2 })[String(id)] ?? CONDUIT;
 
 /** A pool's fee contract, then its other bribe contract, each with the tokens it lists. */
 type Pool = [[Address, Address[]], [Address, Address[]]];
@@ -69,14 +83,19 @@ type Pool = [[Address, Address[]], [Address, Address[]]];
 type World = {
   pools: Pool[];
   earned: Map<string, bigint>;
+  /** The job also claims through the immutable conduit. */
+  v2?: boolean;
   /** How many epoch reads come before the minter starts the epoch. */
   lag?: number;
   /** The node stays at the block before the claims, so it still shows what they took as owed. */
   stale?: boolean;
   /** earned() reads zero for this token after the first read. */
   hide?: Address;
-  ownersFail?: boolean;
+  /** How many reads of the owners fail first, as on a node error, and of the delegates, as on a timeout. */
+  ownersFail?: number;
+  delegatesFail?: number;
   balance?: bigint;
+  proposerBalance?: bigint;
   gas?: (swaps: number, pairs: number) => bigint;
   /** A claim takes one more unit of USDC than is earned. */
   overpays?: boolean;
@@ -95,8 +114,8 @@ type World = {
 const key = (id: unknown, bribe: Address, token: Address) => `${id}${bribe}${token}`.toLowerCase();
 
 /**
- * veNFT 2 is owed $60 of USDC on E1, $10 of USDC and $30 of kVCM on I1, and $10 of HYDX on E2. The others are owed
- * some USDC.
+ * veNFT 2 is owed $60 of USDC on E1, $10 of USDC and $30 of kVCM on I1, and $10 of HYDX on E2, and veNFT 7 $30 of USDC
+ * on E1 and $10 of HYDX on E2. The others are owed some USDC.
  */
 function world(more: Partial<World> = {}): World {
   const earned = new Map([
@@ -108,6 +127,9 @@ function world(more: Partial<World> = {}): World {
     [key(4, E1, USDC), usdc(1)],
     [key(5, E1, USDC), usdc(40)],
     [key(6, E1, USDC), usdc(50)],
+    [key(7, E1, USDC), usdc(30)],
+    [key(7, E2, HYDX), 400n * E18],
+    [key(8, I1, USDC), usdc(3)],
   ]);
   const pools: Pool[] = [
     [
@@ -152,28 +174,43 @@ const reverts = (functionName: string) =>
 const failed = ({ address, functionName, args }: Call, cause: unknown) =>
   new ContractFunctionExecutionError(cause as BaseError, { abi: [], contractAddress: address, functionName, args });
 
+/** A claim through the module, or through the immutable conduit. */
+type Sent = { to: Address; args: readonly unknown[] };
+
+const isV2 = (to: Address | null | undefined) => !!to && isAddressEqual(to, V2);
+
 function fakeChain(w: World = world()) {
-  const live = new Map(w.earned);
+  const initial = new Map(w.earned);
   if (w.partial) {
-    const half = live.get(w.partial)! / 2n;
-    live.set(w.partial, half);
-    live.set(`${w.partial}:later`, half);
+    const half = initial.get(w.partial)! / 2n;
+    initial.set(w.partial, half);
+    initial.set(`${w.partial}:later`, half);
   }
-  const first = new Map(live);
   const listed = new Map(w.pools.flatMap(([fees, other]) => [fees, other]));
   const sent: Hex[] = [];
   const earnedFor = new Set<string>();
+  /** Calls read, by function. */
+  const called = new Map<string, number>();
   let polls = 0;
   let reads = 0;
-  let inFlight: readonly unknown[] = [];
+  let [ownersFail, delegatesFail] = [w.ownersFail ?? 0, w.delegatesFail ?? 0];
+  const inFlight = new Map<Hex, Sent>();
   let head = 40n;
-  let lastClaim = head;
+  /** What is owed from each block on: each claim mined adds one. */
+  const history: [bigint, Map<string, bigint>][] = [[head, initial]];
 
-  const owedAt = (block?: bigint) => ((block ?? (w.stale ? 40n : head)) >= lastClaim ? live : first);
+  const owedAt = (block?: bigint) => {
+    const at = block ?? (w.stale ? 40n : head);
+    return history.findLast(([since]) => since <= at)![1];
+  };
 
-  /** Takes what a claim takes from `owed`. It reverts if a swap sells more than the claim took. */
-  function claim(owed: Map<string, bigint>, args: readonly unknown[]) {
-    const [id, targets, swaps, fees, bribes, tokens] = args as [
+  /**
+   * What is owed after the claim. A claim through the module reverts, and takes nothing, if a swap sells more than the
+   * claim took.
+   */
+  function claim(owed: Map<string, bigint>, { to, args }: Sent) {
+    const v2 = isV2(to);
+    const [id, targets, swaps, fees, bribes, tokens] = (v2 ? [args[0], [], [], ...args.slice(1)] : args) as [
       bigint,
       Address[],
       Hex[],
@@ -198,25 +235,39 @@ function fakeChain(w: World = world()) {
       const [token, amountIn] = decodeAbiParameters(parseAbiParameters("address, uint256"), swap);
       return amountIn <= (amounts[tokens.indexOf(token)] ?? 0n);
     });
-    if (ok) {
-      owed.clear();
-      for (const [pair, amount] of next) owed.set(pair, amount);
-    }
     const owner = owners[String(id)]!;
-    const topics = encodeEventTopics({
-      abi: conduitAbi,
-      eventName: "ClaimSwapAndDistributeCompleted",
-      args: { tokenId: id, owner, recipient: owner },
-    });
-    const data = encodeAbiParameters(parseAbiParameters("address[], uint256[], address[], uint256[], uint256[]"), [
-      tokens,
-      amounts,
-      [KVCM, AZUSD],
-      [1n, 0n],
-      [0n, 0n],
-    ]);
+    const event = v2
+      ? {
+          address: V2,
+          topics: encodeEventTopics({
+            abi: immutableAbi,
+            eventName: "Claimed",
+            args: { tokenId: id, owner, caller: proposer.address },
+          }),
+          data: encodeAbiParameters(parseAbiParameters("address[], uint256[], uint256[], uint256"), [
+            tokens,
+            amounts,
+            amounts.map((amount) => amount / 100n),
+            0n,
+          ]),
+        }
+      : {
+          address: CONDUIT,
+          topics: encodeEventTopics({
+            abi: conduitAbi,
+            eventName: "ClaimSwapAndDistributeCompleted",
+            args: { tokenId: id, owner, recipient: owner },
+          }),
+          data: encodeAbiParameters(parseAbiParameters("address[], uint256[], address[], uint256[], uint256[]"), [
+            tokens,
+            amounts,
+            [KVCM, AZUSD],
+            [1n, 0n],
+            [0n, 0n],
+          ]),
+        };
     const gasUsed = w.gas ? w.gas(targets.length, asked.length * tokens.length) : 8_000_000n;
-    return { ok, gasUsed, logs: ok ? [{ address: CONDUIT, topics, data }] : [] };
+    return { ok, gasUsed, logs: ok ? [event] : [], owed: ok ? next : owed };
   }
 
   function answerAt({ address, functionName, args = [] }: Call, owed: Map<string, bigint>): unknown {
@@ -239,17 +290,17 @@ function fakeChain(w: World = world()) {
       case `${VOTER}.external_bribes`:
         return w.pools[Number(BigInt(a as Address)) - 2_000]![1][0];
       case `${VE}.getPastVotes`:
-        return Object.entries(powers).reduce((sum, [id, power]) => (id === "1" ? sum : sum + power), 0n);
+        return Object.entries(powers).reduce((sum, [id, power]) => (delegateOf(id) === a ? sum + power : sum), 0n);
       case `${VE}.totalNftsMinted`:
-        return 6n;
+        return 8n;
       case `${VE}.delegates`:
         assert.equal(b, ENDED, "the delegates when the epoch that ended began");
-        return a === 1n ? OTHER : CONDUIT;
+        return delegateOf(a);
       case `${VE}.ownerOf`:
         if (!owners[String(a)]) throw reverts("ownerOf");
         return owners[String(a)];
       case `${VE}.isApprovedClaimRedirectOrOwner`:
-        assert.equal(a, CONDUIT);
+        assert.equal(a, delegateOf(b), "the conduit that claims for it");
         return !unapproved.has(String(b));
       case `${VE}.balanceOfNFTAt`:
         return powers[String(a)];
@@ -282,7 +333,7 @@ function fakeChain(w: World = world()) {
       case "decimals":
         return address === USDC ? 6 : 18;
       case "balanceOfOwnerAt":
-        assert.equal(a, CONDUIT);
+        assert.ok(a === CONDUIT || a === V2);
         return listed.has(address) && b === ENDED ? 50n : 0n;
       case "rewardsListLength":
         return BigInt(listed.get(address)!.length);
@@ -318,11 +369,13 @@ function fakeChain(w: World = world()) {
       allowFailure: boolean;
       blockNumber?: bigint;
     }) => {
+      if (contracts.some((c) => c.functionName === "delegates") && delegatesFail-- > 0) throw new Error("timeout");
       if (contracts.some((c) => c.functionName === "earned")) reads++;
+      for (const { functionName } of contracts) called.set(functionName, (called.get(functionName) ?? 0) + 1);
       const owed = owedAt(blockNumber);
       const answer = (c: Call) => answerAt(c, owed);
       if (!allowFailure) return contracts.map(answer);
-      if (w.ownersFail && contracts.some((c) => c.functionName === "ownerOf")) {
+      if (contracts.some((c) => c.functionName === "ownerOf") && ownersFail-- > 0) {
         // A node error (-32603) looks like a revert of the multicall contract.
         const error = failed({ address: MULTICALL3, functionName: "aggregate3" }, reverts("aggregate3"));
         return contracts.map(() => ({ status: "failure", error }));
@@ -341,13 +394,14 @@ function fakeChain(w: World = world()) {
       blocks,
       blockNumber,
     }: {
-      blocks: { blockOverrides?: unknown; calls: { args: unknown[] }[] }[];
+      blocks: { blockOverrides?: unknown; calls: Sent[] }[];
       blockNumber?: bigint;
     }) => {
       assert.equal(blocks[0]!.blockOverrides, undefined, "a claim does not depend on the time");
-      const owed = new Map(owedAt(blockNumber));
-      const calls = blocks[0]!.calls.map(({ args }) => {
-        const { ok, ...result } = claim(owed, args);
+      let owed = owedAt(blockNumber);
+      const calls = blocks[0]!.calls.map((call) => {
+        const { ok, owed: after, ...result } = claim(owed, call);
+        owed = after;
         return ok
           ? { status: "success", ...result }
           : { status: "failure", error: new Error("swap failed"), ...result };
@@ -360,35 +414,42 @@ function fakeChain(w: World = world()) {
       gasUsedRatio: [0.2, 0.3],
       reward: [[1_000_000n], [1_000_000n]],
     }),
-    getTransactionCount: async ({ blockTag }: { blockTag: string }) =>
-      7 + sent.length + (w.pending && blockTag === "pending" ? 1 : 0),
-    getBalance: async () => w.balance ?? E18,
+    getTransactionCount: async ({ address, blockTag }: { address: Address; blockTag: string }) =>
+      7 + sent.filter((signed) => fromOf(signed) === address).length + (w.pending && blockTag === "pending" ? 1 : 0),
+    getBalance: async ({ address }: { address: Address }) =>
+      (address === proposer.address ? w.proposerBalance : w.balance) ?? E18,
     estimateL1Fee: async () => 5_000n,
     waitForTransactionReceipt: async ({ hash, confirmations }: { hash: Hex; confirmations: number }) => {
       assert.equal(confirmations, 2, "a block past the claim's");
-      const { ok, logs } = claim(live, inFlight);
+      const { ok, logs, owed } = claim(owedAt(head), inFlight.get(hash)!);
       head += 2n;
-      lastClaim = head - 1n;
-      return { transactionHash: hash, status: ok ? "success" : "reverted", blockNumber: lastClaim, logs };
+      history.push([head - 1n, owed]);
+      return { transactionHash: hash, status: ok ? "success" : "reverted", blockNumber: head - 1n, logs };
     },
   } as unknown as Client;
   const broadcast = async (signed: Hex) => {
     sent.push(signed);
-    inFlight = decodeFunctionData({ abi: moduleAbi, data: parseTransaction(signed).data! }).args;
+    const { to, data } = parseTransaction(signed);
+    const { args } = decodeFunctionData({ abi: isV2(to) ? immutableAbi : moduleAbi, data: data! });
+    inFlight.set(keccak256(signed), { to: to!, args: args! });
     return keccak256(signed);
   };
   const chain: Chain = {
     client,
     bulk: client,
+    v2Client: client,
     broadcast,
     module: MODULE,
     conduit: CONDUIT,
     keeper: signer.address,
     voter: VOTER,
     ve: VE,
+    ...(w.v2 ? { v2: { conduit: V2, proposer: proposer.address, priced: [USDC] } } : {}),
   };
-  return { chain, sent, earnedFor };
+  return { chain, sent, earnedFor, called };
 }
+
+const fromOf = (signed: Hex) => (isV2(parseTransaction(signed).to) ? proposer.address : signer.address);
 
 const prices = new Map<Address, number>([
   [USDC.toLowerCase() as Address, 1],
@@ -428,7 +489,7 @@ function fakeSwapper({ refuse = [], bad, lossy }: Swaps = {}) {
 
 function runOf(chain: Chain, { dryRun = false, account = signer as LocalAccount } = {}): Run {
   const tokens = [USDC, KVCM, WETH, HYDX, ...ODD].map((token) => ({ token, name: token.slice(0, 6) }));
-  return { chain, tokens, prices: async () => prices, account, dryRun };
+  return { chain, tokens, prices: async () => prices, account, proposer, dryRun };
 }
 
 const decode = (signed: Hex) => {
@@ -446,6 +507,16 @@ const decode = (signed: Hex) => {
   ];
   return { id, targets, fees, bribes, tokens, tonnes, maxKvcmIn };
 };
+
+const decodeV2 = (signed: Hex) => {
+  const { args, functionName } = decodeFunctionData({ abi: immutableAbi, data: parseTransaction(signed).data! });
+  assert.equal(functionName, "claim");
+  const [id, fees, bribes, tokens] = args as readonly [bigint, Address[], Address[], Address[]];
+  return { id, fees, bribes, tokens };
+};
+
+/** The sent claims through the module, or through the immutable conduit. */
+const through = (sent: Hex[], v2 = false) => sent.filter((signed) => isV2(parseTransaction(signed).to) === v2);
 
 const until = () => Date.now() + 600_000;
 
@@ -469,6 +540,48 @@ test("claims each delegator's most valuable rewards, swapped to kVCM, and retire
 
 test("the Klima Foundation's veNFTs are excluded", () => {
   assert.equal(EXCLUDED_OWNERS.get(FOUNDATION.toLowerCase()), "Klima Foundation");
+});
+
+test("the immutable conduit's delegators are claimed for too, by the proposer, Klima Foundation included", async () => {
+  const { chain, sent, earnedFor, called } = fakeChain(world({ v2: true }));
+  const { swapper, asked } = fakeSwapper();
+  assert.equal(await claims(runOf(chain), START, until(), swapper), 0);
+  const [claim, ...more] = through(sent, true);
+  assert.equal(more.length, 0, "veNFT 7 only: 8 has $3 to claim");
+  assert.deepEqual(decodeV2(claim!), { id: 7n, fees: [], bribes: [E1, E2], tokens: [USDC, HYDX] });
+  assert.equal(await recoverTransactionAddress({ serializedTransaction: claim! as never }), proposer.address);
+  assert.equal(parseTransaction(claim!).nonce, 7, "at the proposer's nonce");
+  assert.deepEqual(
+    through(sent)
+      .map(decode)
+      .map(({ id }) => id),
+    [2n],
+    "the Klima conduit still claims for veNFT 2",
+  );
+  assert.deepEqual(asked, [USDC, HYDX], "only the Klima conduit's claim swaps");
+  assert.deepEqual([...earnedFor].sort(), ["2", "4", "7", "8"]);
+  assert.equal(called.get("delegates"), 8, "one scan of the veNFTs for both conduits");
+  assert.equal(called.get("gauges"), 2, "one read of the bribe contracts for both");
+  assert.equal(called.get("firstBribeTimestamp"), 6, "of the three contracts that pay each conduit: I2 pays none");
+  assert.equal(called.get("decimals"), 4 + ODD.length, "one of the decimals, for both");
+});
+
+test("a read both conduits share that fails is read again, once for both", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Number(START) * 1000 + 10_000 });
+  const { chain, sent, called } = fakeChain(world({ v2: true, delegatesFail: 1 }));
+  assert.equal(await drive(t, claims(runOf(chain), START, until(), fakeSwapper().swapper)), 0);
+  assert.deepEqual([through(sent).length, through(sent, true).length], [1, 1], "both conduits claim");
+  assert.equal(called.get("delegates"), 8, "one scan once read again");
+});
+
+test("each conduit's claims go on when the other's stop", async () => {
+  const broke = 10n ** 15n; // less than a claim and the reserve for the votes
+  const keeper = fakeChain(world({ v2: true, balance: broke }));
+  assert.equal(await claims(runOf(keeper.chain), START, until(), fakeSwapper().swapper), 1);
+  assert.deepEqual([through(keeper.sent).length, through(keeper.sent, true).length], [0, 1]);
+  const v2 = fakeChain(world({ v2: true, proposerBalance: broke }));
+  assert.equal(await claims(runOf(v2.chain), START, until(), fakeSwapper().swapper), 1);
+  assert.deepEqual([through(v2.sent).length, through(v2.sent, true).length], [1, 0]);
 });
 
 test("a token without a route is left out of the veNFT's claims; one whose swap loses too much, capped", async () => {
@@ -543,6 +656,9 @@ test("a claim never replaces a transaction pending at its nonce, which may be a 
   const { chain, sent } = fakeChain(world({ pending: true }));
   assert.equal(await claims(runOf(chain), START, until(), fakeSwapper().swapper), 1);
   assert.equal(sent.length, 0);
+  const both = fakeChain(world({ pending: true, v2: true }));
+  assert.equal(await claims(runOf(both.chain), START, until(), fakeSwapper().swapper), 2, "the proposer's too");
+  assert.equal(both.sent.length, 0);
 });
 
 test("a dry run simulates each claim after those it prepared, and signs them without sending", async () => {
@@ -643,10 +759,15 @@ test("a claim must leave the keeper enough for the next votes", async () => {
   assert.equal(sent.length, 0);
 });
 
-test("a node that fails to read the owners fails the claims: its veNFTs are not taken for burned", async () => {
-  const { chain, sent } = fakeChain(world({ ownersFail: true }));
-  assert.equal(await claims(runOf(chain), START, until(), fakeSwapper().swapper), 1);
-  assert.equal(sent.length, 0);
+test("a conduit's reads that fail are read again; a node that keeps failing to read the owners fails the claims", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: Number(START) * 1000 + 10_000 });
+  const once = fakeChain(world({ ownersFail: 1 }));
+  assert.equal(await drive(t, claims(runOf(once.chain), START, until(), fakeSwapper().swapper)), 0);
+  assert.equal(once.sent.length, 1, "claimed at the second try");
+  const { chain, sent, called } = fakeChain(world({ ownersFail: Infinity }));
+  assert.equal(await drive(t, claims(runOf(chain), START, until(), fakeSwapper().swapper)), 1);
+  assert.equal(sent.length, 0, "its veNFTs are not taken for burned");
+  assert.equal(called.get("ownerOf"), 3 * 5, "three tries for its five delegators");
 });
 
 async function drive<T>(t: TestContext, promise: Promise<T>): Promise<T> {
@@ -692,6 +813,8 @@ test("a plan asks the bribe contracts that pay most for the tokens that pay most
   const tight = planClaim(pairs, 3_000_000n, 0, swapped)!;
   assert.deepEqual([tight.tokens, tight.bribes, tight.fees], [[USDC], [E1], [I1]], "one token, two contracts fit");
   assert.equal(planClaim(pairs, 2_000_000n, 0, swapped), undefined, "nothing fits");
+  const unswapped = planClaim(pairs, 3_000_000n, 0, () => false, new Map(), 400_000n)!;
+  assert.deepEqual([unswapped.tokens, unswapped.gas], [[USDC, KVCM], 1_600_000n], "cheaper claims fit more");
   assert.equal(planClaim([], 10_000_000n, 0, swapped), undefined);
   const capped = planClaim(pairs, 10_000_000n, 0, swapped, new Map([[USDC, 35]]))!;
   assert.deepEqual([capped.fees, capped.bribes, capped.usd], [[I1], [E2], 50], "E1 owes more USDC than the cap");
