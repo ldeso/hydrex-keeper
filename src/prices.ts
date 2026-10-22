@@ -123,18 +123,23 @@ export function combined(sources: PriceSource[]): PriceSource {
   };
 }
 
-/** Fetches at every call; reuses the last set near `until` if it covers every token, or if the fetch fails. */
+/**
+ * Fetches at every call; reuses the last set if it was fetched for every token asked for, near `until` or when the
+ * fetch fails. A set fetched for other tokens would leave these unpriced, and count them as zero: the fetch's failure
+ * is thrown instead.
+ */
 export function priceFeed(source: PriceSource): (tokens: Address[], until?: number) => Promise<Prices> {
   let last: { at: number; requested: Set<Address>; map: Prices } | undefined;
   return async (tokens, until = Infinity) => {
     const requested = unique(tokens);
-    if (last && until - Date.now() < REFRESH_BUDGET_MS && requested.every((t) => last!.requested.has(t)))
-      return last.map;
+    const covering = last && requested.every((t) => last!.requested.has(t)) ? last : undefined;
+    if (covering && until - Date.now() < REFRESH_BUDGET_MS) return covering.map;
     try {
       last = { at: Date.now(), requested: new Set(requested), map: await source.get(requested, until) };
     } catch (error) {
-      if (!last) throw error;
-      log.warning("using the last prices", { ageMs: Date.now() - last.at, reason: errorMessage(error) });
+      if (!covering) throw error;
+      log.warning("using the last prices", { ageMs: Date.now() - covering.at, reason: errorMessage(error) });
+      return covering.map;
     }
     return last.map;
   };

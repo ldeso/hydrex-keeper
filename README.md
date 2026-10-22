@@ -6,14 +6,15 @@ of the conduit's delegators after each epoch flip. It signs with the HSM-held ke
 Safe module of [hydrex-conduit-executor](https://github.com/ldeso/hydrex-conduit-executor), which forwards them to the
 conduit. It can also vote and claim for the immutable conduit of
 [hydrex-conduit](https://github.com/ldeso/hydrex-conduit), which anyone may propose a vote to or claim through, with a
-second key. This repository holds the job in `src/`, whose only dependency is `viem`, the tokens whose rewards it counts
-and claims in `tokens.json`, and the scripts in `sh/` that create, deploy and check its Google Cloud project, with the
-IAM policies they write in `policy/`.
+second key, and then tops up both keys' ETH from that conduit's treasury. This repository holds the job in `src/`, whose
+only dependency is `viem`, the tokens whose rewards it counts and claims in `tokens.json`, and the scripts in `sh/` that
+create, deploy and check its Google Cloud project, with the IAM policies they write in `policy/`.
 
 ## How it votes
 
 Hydrex epochs flip on Thursday at 00:00 UTC, and votes do not carry over. Cloud Scheduler starts the job at 23:50 UTC on
-Tuesday and on Wednesday.
+Tuesday and on Wednesday. The Tuesday run first tops up the keys: see
+[How it tops up its keys](#how-it-tops-up-its-keys).
 
 - **A day before the flip**, it votes in proportion to each pool's rewards. This vote is always cast, as a fallback.
 - **In the last two blocks before the flip**, it votes for the largest expected reward: `x` votes on a pool with `V`
@@ -83,12 +84,36 @@ Claims go one at a time for each conduit, the largest first, in the hour after t
 same time. A conduit's claims stop if a claim would leave its key, the keeper or the proposer, with less than 0.001 ETH,
 which is kept for the votes, or if another transaction of that key, such as a vote, is pending.
 
+## How it tops up its keys
+
+When `CONDUIT` is set, the Tuesday run first tops up the keeper and the proposer, before the week's votes and claims
+spend their ETH, with USDC from the immutable conduit's treasury: the Safe that the conduit's `TREASURY()` names, which
+takes its 1% fee. Through Safe's Allowance Module, version 1.0.0, the Safe lets the proposer draw USDC up to a weekly
+allowance. The proposer sends every transaction of a top-up; the keeper's key only receives ETH.
+
+- **How much:** each key is topped up to 0.003 ETH, so that it ends the week above the 0.002 ETH that `check.sh` asks
+  for. The proposer draws the USDC that both lack, counting the USDC it holds and its own ETH beyond 0.003, which can go
+  to the keeper; the keeper's beyond 0.003 cannot go to the proposer. When the allowance or the treasury cannot pay for
+  both, the two keys end even. Less than 1 USDC to swap, or 0.0001 ETH to send the keeper, waits for a later week.
+- **How:** the proposer approves the exact amount to the router of whichever of three deep USDC-WETH pools quotes the
+  most: Uniswap v3's at 0.05%, through Uniswap's SwapRouter02, or Aero's Slipstream pools with tick spacings 100 and 50,
+  through Aero's SwapRouter. In one call, the router swaps the USDC and unwraps the WETH to the proposer, which then
+  sends the keeper its share. The swap is quoted before anything is drawn, and again just before it is sent: it is not
+  made if it would pay more than 2% under the job's prices, and its minimum is 0.5% under its last quote. The top-up has
+  5 minutes, and the run's vote comes 10 minutes after it starts.
+- **Where from:** the job reads the treasury from the conduit. The module, the routers, their quoters (Uniswap's
+  QuoterV2 and Aero's Metaquoter) and the pools are fixed in `src/topup.ts`; the Safe's owners enable the module, add
+  `PROPOSER` as a delegate, and set its USDC allowance.
+
 ## What it can and cannot do
 
-- **It votes and claims.** `src/vote.ts` and `src/claim.ts` build every transaction the job sends: the module's `vote`,
-  for pools with a live gauge that pay rewards in the tokens of `tokens.json`, and its `claimSwapAndDistribute`, for
-  veNFTs delegated to the conduit, with KyberSwap calldata the job decodes and checks; and the immutable conduit's
-  `vote`, for the same pools, and its `claim`, for veNFTs delegated to it.
+- **It votes, claims and tops up its keys.** `src/vote.ts`, `src/claim.ts` and `src/topup.ts` build every transaction
+  the job sends: the module's `vote`, for pools with a live gauge that pay rewards in the tokens of `tokens.json`, and
+  its `claimSwapAndDistribute`, for veNFTs delegated to the conduit, with KyberSwap calldata the job decodes and checks;
+  the immutable conduit's `vote`, for the same pools, and its `claim`, for veNFTs delegated to it; and the proposer's
+  top-up: the Allowance Module's `executeAllowanceTransfer`, of USDC from the treasury to the proposer, its approval of
+  USDC to Uniswap's or Aero's router, that router's `multicall`, which swaps the USDC and unwraps the WETH to it, and a
+  plain transfer of ETH to the keeper.
 - **The key never leaves the HSM.** Cloud KMS signs, and a signature that does not recover to `KEEPER` is never sent.
   The job's service account is the key's only signer; it has no keys, and no role in its own project beyond reading its
   secrets.
@@ -98,9 +123,10 @@ which is kept for the votes, or if another transaction of that key, such as a vo
 - **The rest is checked on chain.** The module checks the caller; the conduit and the Voter check gauges, voting power
   and the epoch. For a claim, the conduit also checks that the veNFT lets it claim, and that each swap goes through a
   router it approves and buys a token it pays out.
-- **The proposer key has no privileges.** Anyone may propose the immutable conduit's vote and claim through it, so its
-  key can do nothing more than any account; it only holds the ETH that pays for those votes and claims. It is a second
-  HSM key, and the job's service account is its only signer too.
+- **The proposer key can draw from the treasury.** Anyone may propose the immutable conduit's vote and claim through it,
+  so there its key can do nothing more than any account. But the treasury lets it draw its weekly USDC allowance, to any
+  address: whoever can sign with it can take that much a week from the treasury, and no more. It is a second HSM key,
+  and the job's service account is its only signer too. The keeper's key takes no part in top-ups but to receive.
 
 ## Deployment
 
@@ -111,11 +137,20 @@ which is kept for the votes, or if another transaction of that key, such as a vo
 - **`CONDUIT`:** [`0x692c323B425A9DfeebE302F56168a7798D93EAC5`][immutable], `ImmutableVeTokenConduit`, version 2.
 - **`PROPOSER`:** [`0x52c139f60452B93e1211F116BD43B28d7AfC2bCa`][proposer], the Cloud KMS HSM key `hydrex-proposer-v1`,
   version 1.
+- **Treasury:** [`0x450c72de8c0079B49AcedF294a13011bd09D125B`][treasury], a 2-of-3 Safe. Its Allowance Module,
+  [`0x691f59471Bfd2B7d639DCF74671a2d648ED1E331`][allowance], lets `PROPOSER` draw 10 USDC a week, reset on Mondays at
+  00:00 UTC.
+- **Routers:** Uniswap's SwapRouter02, [`0x2626664c2603336E57B271c5C0b26F421741e481`][uniswap], and Aero's Slipstream
+  SwapRouter, [`0x9Ee35Bf1bd69a03c6F0393582030fCe8Bb93D418`][aero], as their documentation lists them.
 
 [module]: https://basescan.org/address/0x750973E0CB728C3112561Bc8E9b235afA9B17E81
 [keeper]: https://basescan.org/address/0x625CF6663d9D090535FBd57680bFFE6fA0262434
 [immutable]: https://basescan.org/address/0x692c323B425A9DfeebE302F56168a7798D93EAC5
 [proposer]: https://basescan.org/address/0x52c139f60452B93e1211F116BD43B28d7AfC2bCa
+[treasury]: https://basescan.org/address/0x450c72de8c0079B49AcedF294a13011bd09D125B
+[allowance]: https://basescan.org/address/0x691f59471Bfd2B7d639DCF74671a2d648ED1E331
+[uniswap]: https://basescan.org/address/0x2626664c2603336E57B271c5C0b26F421741e481
+[aero]: https://basescan.org/address/0x9Ee35Bf1bd69a03c6F0393582030fCe8Bb93D418
 
 ## Setup
 
@@ -135,13 +170,16 @@ to re-run.
 5. **Fund the keeper and the proposer.** Send ETH on Base to `KEEPER` and `PROPOSER`. The keeper's vote costs about
    0.00005 ETH and a claim up to 0.0001 ETH, and claims always leave 0.001 ETH for the votes: 0.01 ETH lasts it about
    three months. The proposer's votes take more gas and its claims less, and its claims leave it 0.001 ETH too: 0.01 ETH
-   lasts it months.
+   lasts it months. With `CONDUIT` set, every Tuesday the job then tops both up to 0.003 ETH from the treasury, if the
+   treasury lets the proposer draw USDC and holds enough of it; the proposer pays for the top-ups, so it needs ETH to
+   start.
 6. **Deploy.** `sh/deploy.sh` builds the image with Cloud Build and deploys the job and its schedule. Run it again after
    any change to `src/` or `tokens.json`.
-7. **Try it.** `sh/run.sh --dry-run --now` runs the vote of a day before the flip at once and signs it with KMS, but
-   sends nothing; `sh/run.sh --now` sends it. `sh/run.sh --dry-run --claim` does the same for the claims. Without
-   `--dry-run`, `--now` and `--claim` are refused while the schedule may be voting or claiming. The logs are in Cloud
-   Run, one JSON object per line.
+7. **Try it.** `sh/run.sh --dry-run --now` runs the Tuesday run at once, the top-up then the vote of a day before the
+   flip, and signs the vote with KMS, but sends nothing; `sh/run.sh --now` sends them. `sh/run.sh --dry-run --claim`
+   does the same for the claims. Without `--dry-run`, `--now` and `--claim` are refused while the schedule may be voting
+   or claiming, and `--claim` also when that is within the hour it claims for. The logs are in Cloud Run, one JSON
+   object per line.
 
 A deployment that votes for the Klima conduit alone adds the immutable conduit by setting `CONDUIT`, `PROPOSER` and
 `PROPOSER_KMS_KEY_VERSION` in `config.env` and in the repository variables of the `check` workflow, funding `PROPOSER`,
@@ -152,7 +190,8 @@ proposer key.
 
 `sh/check.sh` compares the live project with `config.env` and `policy/`, read-only: the job, its schedule, the secrets,
 the service accounts, IAM and the alerts. It also fails if the keeper or the proposer holds less than 0.002 ETH, to warn
-before their claims stop at 0.001 ETH, and before the proposer cannot pay for a vote in busy blocks.
+before their claims stop at 0.001 ETH, and before the proposer cannot pay for a vote in busy blocks: with top-ups, when
+those stop.
 
 The `check` workflow runs it every Friday, after the vote, and on demand. It signs in through Workload Identity
 Federation as a service account with the roles above, named by the `WIF_PROVIDER` and `CI_SERVICE_ACCOUNT` repository
@@ -168,7 +207,9 @@ detects keys, and change `tokens.json` by pull request, then redeploy.
   every URL; in the last blocks, a vote that no URL accepts fails the execution, unless the vote it replaces landed
   first. The claims' reads are much heavier, so each goes to one URL at a time, which has 30 s to answer.
 - **Prices:** DefiLlama and Alchemy, and CoinGecko if `COINGECKO_SECRET` is set; a price is the median of their quotes,
-  or the lower of two. A token without a price counts as zero, and the vote fails if no token has one.
+  or the lower of two. A token without a price counts as zero, and the vote fails if no token has one. If every source
+  fails, or less than 20 s are left, the last prices are used, but only if they were fetched for every token asked: the
+  top-up's do not stand in for the vote's.
 - **Keeper balance:** a vote needs twice its maximum cost in the keeper, so that it leaves enough to vote in the last
   blocks; a vote in the last blocks needs it once; a claim needs it plus 0.001 ETH. Short of that, the job refuses to
   vote or claim and logs `fund the keeper`.
@@ -189,16 +230,25 @@ detects keys, and change `tokens.json` by pull request, then redeploy.
   execution.
 - **Klima conduit:** without voting power this epoch, it gets no vote, and the job fails the execution; the immutable
   conduit still votes.
+- **Top-ups:** everything goes through the proposer: if it cannot pay for a transaction, which logs `fund the proposer`,
+  or has one pending, neither key is topped up. That, a treasury that holds too little USDC, once the proposer drew what
+  it holds, a swap quoted more than 2% under the prices, a transaction that would revert or whose outcome is unknown,
+  and a top-up still sending after 5 minutes, fail the execution after the run's vote; its retry tops up again. A swap
+  never takes less than 98% of what the prices make its USDC worth, and is quoted again before it is sent. An allowance
+  used up this week, or none, only logs a warning. USDC the proposer is left with is swapped by its next top-up. A dry
+  run checks each transaction as the run would, on what those before it leave the proposer. A top-up transaction whose
+  outcome is unknown does not hold up the proposer's vote, which replaces it at its nonce.
 
 ## Development
 
 Needs Node 26. Run `npm ci`, then `npm run typecheck`, `npm test` and `npm run format` before committing.
 `MODULE=0x750973E0CB728C3112561Bc8E9b235afA9B17E81 BASE_RPC_URLS=… npm run dry-run` runs the vote of a day before the
 flip against Base without KMS, and sends nothing; `npm run dry-run-claim` does the same with the claims. With `CONDUIT`
-and `PROPOSER` set too, the dry runs also plan the immutable conduit's vote and claims. `test/sh/golden.sh` runs the
-scripts under `dash` (or `$TEST_SH`) against a fake `gcloud` and `curl` and compares the calls and output with
-`test/sh/golden/`; `--update` rewrites them. CI runs the type check, the tests, Prettier, the golden tests, `shellcheck`
-and `reuse lint`, and builds the image. Dependabot updates the pinned Actions, npm packages and base images.
+and `PROPOSER` set too, the dry runs also plan the immutable conduit's vote and claims, and `npm run dry-run` first
+simulates the top-up, each transaction after those before it. `test/sh/golden.sh` runs the scripts under `dash` (or
+`$TEST_SH`) against a fake `gcloud` and `curl` and compares the calls and output with `test/sh/golden/`; `--update`
+rewrites them. CI runs the type check, the tests, Prettier, the golden tests, `shellcheck` and `reuse lint`, and builds
+the image. Dependabot updates the pinned Actions, npm packages and base images.
 
 ## Limitations
 

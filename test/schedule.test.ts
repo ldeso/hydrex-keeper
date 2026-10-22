@@ -43,6 +43,21 @@ test("--now and --claim are refused while the schedule may be sending, unless in
   assert.deepEqual(task(flip, flip - 2n * DAY, start({ claim: true })), { what: "claims", recheck: false });
 });
 
+test("--claim is refused when the hour it claims for reaches a window of the schedule", () => {
+  for (const at of [flip - DAY - HORIZON - 1n, flip - HORIZON - HORIZON / 2n]) {
+    assert.equal(due(flip, at), undefined, "nothing due when it starts");
+    assert.throws(() => task(flip, at, start({ claim: true })), /--claim would race the scheduled/);
+    assert.equal(task(flip, at, start({ claim: true, dryRun: true })).what, "claims");
+    assert.deepEqual(
+      task(flip, at, start({ now: true })),
+      { what: "day before", recheck: false },
+      "--now sends at once",
+    );
+  }
+  const before = flip - DAY - 2n * HORIZON;
+  assert.deepEqual(task(flip, before, start({ claim: true })), { what: "claims", recheck: false }, "done before it");
+});
+
 test("a retry of the vote of a day before leaves out a conduit whose vote is in; a first attempt or --now does not", () => {
   assert.deepEqual(task(flip, flip - DAY, start()), { what: "day before", recheck: false });
   assert.deepEqual(task(flip, flip - DAY, start({ retry: true })), { what: "day before", recheck: true });

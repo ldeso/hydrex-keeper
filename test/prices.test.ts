@@ -93,11 +93,10 @@ test("priceFeed fetches a new token near the deadline and serves the last set wh
     1,
     "a new token forces a fetch",
   );
-  const last = await feed([WETH, JUNK], Date.now() + 1_500);
-  assert.deepEqual(
-    [last.get(WETH), last.has(JUNK)],
-    [2, false],
-    "the fetch failed: the last set, the new token unpriced",
+  await assert.rejects(
+    feed([WETH, JUNK], Date.now() + 1_500),
+    /DefiLlama unavailable/,
+    "the fetch failed, and the last set would leave the new token unpriced",
   );
   assert.equal(urls.length, 3);
   const empty = fakeFetch([() => new Response("", { status: 503 })]);
@@ -106,6 +105,33 @@ test("priceFeed fetches a new token near the deadline and serves the last set wh
     /DefiLlama unavailable/,
     "no last set",
   );
+});
+
+test("priceFeed falls back only on a set fetched for every token asked for, as the top-up's is not for the votes'", async () => {
+  const answers: (Map<Address, number> | Error)[] = [
+    new Map([[WETH, 3000]]),
+    new Error("down"),
+    new Error("down"),
+    new Map([
+      [WETH, 3000],
+      [JUNK, 1],
+    ]),
+    new Error("down"),
+  ];
+  const source: PriceSource = {
+    name: "stub",
+    get: async () => {
+      const answer = answers.shift()!;
+      if (answer instanceof Error) throw answer;
+      return answer;
+    },
+  };
+  const feed = priceFeed(source);
+  await feed([WETH], Infinity);
+  await assert.rejects(feed([WETH, JUNK], Infinity), /down/, "a set for fewer tokens is no fallback");
+  assert.equal((await feed([WETH], Infinity)).get(WETH), 3000, "the same tokens: the last set");
+  await feed([JUNK, WETH], Infinity);
+  assert.equal((await feed([WETH], Infinity)).get(WETH), 3000, "fewer tokens: the last set");
 });
 
 test("a malformed 200 response is retried", async () => {

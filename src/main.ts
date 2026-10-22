@@ -12,6 +12,7 @@ import { alchemy, coingecko, combined, defillama, priceFeed } from "./prices.ts"
 import { assertFresh, readEpoch } from "./read.ts";
 import { DAY, HORIZON, lastFlip, task } from "./schedule.ts";
 import type { Vote } from "./select.ts";
+import { TOP_UP_MS, topUp } from "./topup.ts";
 import { klimaSender, v2Sender, VoteSent, type Sender } from "./vote.ts";
 import { parseWhitelist } from "./whitelist.ts";
 
@@ -88,6 +89,10 @@ async function main(): Promise<number> {
     const until = claimNow ? Date.now() + Number(HORIZON) * 1000 : Number(flip + HORIZON) * 1000;
     return (await claims(run, flip, until)) || failed ? 1 : 0;
   }
+  // First thing on the Tuesday run: the keys hold, for the week's votes and claims, what they hold after it. A top-up
+  // transaction whose outcome is unknown does not hold up the proposer's vote, which replaces it at its nonce, at a
+  // quarter more in fees: see prepareTx.
+  const topUpFailures = what === "day before" ? await topUp(run, Date.now() + TOP_UP_MS) : 0;
   assertFresh(epoch);
   const { flip } = epoch;
   // Each conduit votes if it has voting power this epoch, whatever becomes of the other.
@@ -124,7 +129,7 @@ async function main(): Promise<number> {
     await passV2(run, await reads(attempt), until, klimaVote);
   };
   const v2Done = !v2 || (await attempts("v2 pass", v2Pass, until));
-  return failed || !klimaDone || !v2Done ? 1 : 0;
+  return failed || topUpFailures > 0 || !klimaDone || !v2Done ? 1 : 0;
 }
 
 /** Runs `pass` up to ATTEMPTS times, while time is left before `until` (ms); returns whether it succeeded. */

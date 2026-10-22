@@ -12,7 +12,7 @@ import {
 } from "viem";
 import { conduitAbi, immutableAbi, retirementAbi, veAbi } from "./abi.ts";
 import { sleep } from "./blocks.ts";
-import { call, lower, readEach, readMany, WEEK, type Call, type Chain } from "./chain.ts";
+import { blockAtLeast, call, lower, readEach, readMany, WEEK, WETH, type Call, type Chain } from "./chain.ts";
 import { BadSwap, kyberswap, SwapRefused, type Swap, type Swapper } from "./kyber.ts";
 import { errorMessage, log } from "./log.ts";
 import { tokensOf, type Run } from "./pass.ts";
@@ -20,11 +20,11 @@ import type { Prices } from "./prices.ts";
 import { bribeCall, readBribes, readDecimals, readEpoch, readRewardTokens, type Bribe, type Reader } from "./read.ts";
 import {
   broadcastTx,
+  confirmTx,
   klimaSender,
-  markMined,
   prepareCall,
-  RECEIPT_TIMEOUT_MS,
   signTx,
+  Unconfirmed,
   v2Sender,
   type ModuleCall,
   type Sender,
@@ -59,7 +59,6 @@ const MINTER_POLL_MS = 5_000;
 const READ_TRIES = 3; // of a conduit's reads before its claims
 const READ_RETRY_MS = 5_000;
 const TONNE = 10n ** 18n;
-const WETH: Address = "0x4200000000000000000000000000000000000006";
 
 /**
  * What one bribe contract owes a veNFT in one token, in USD. `later` is owed too, but beyond the epochs earned() looks
@@ -467,7 +466,7 @@ async function claimOnce(ctx: Context, nft: Nft): Promise<boolean> {
       log.info("not claimed: too little", { ...which, claimable: plan?.usd ?? 0, left: usd });
       return false;
     }
-    const at = await blockAtLeast(ctx);
+    const at = await blockAtLeast(chain, ctx.pinned);
     const built = await buildClaim(ctx, nft, plan, at);
     if (Array.isArray(built)) {
       for (const refusal of built) refuse(ctx, nft, refusal);
@@ -661,15 +660,10 @@ function checkTaken({ klima, sender }: Context, logs: readonly Log[], { swaps }:
 }
 
 async function confirm({ chain, sender, klima }: Context, id: bigint, hash: Hex, nonce: number): Promise<bigint> {
-  let receipt;
-  try {
-    receipt = await chain.client.waitForTransactionReceipt({ hash, timeout: RECEIPT_TIMEOUT_MS, confirmations: 2 });
-  } catch (error) {
-    throw new Stop(`claim ${hash}: outcome unknown: ${errorMessage(error)}`);
-  }
-  if (receipt.transactionHash !== hash) throw new Stop(`claim ${hash} was replaced by ${receipt.transactionHash}`);
-  markMined(chain, nonce, sender.from);
-  if (receipt.status !== "success") throw new Error(`claim ${hash} reverted`);
+  // A claim whose outcome is unknown stops the claims: another could take what it may have taken.
+  const receipt = await confirmTx(chain, sender.from, hash, nonce, "claim").catch((error: unknown) => {
+    throw error instanceof Unconfirmed ? new Stop(error.message) : error;
+  });
   const ours = (event: { address: Address }) => isAddressEqual(event.address, sender.conduit);
   const fields = { conduit: sender.conduit, tokenId: id, hash, block: receipt.blockNumber };
   if (!klima) {
@@ -689,11 +683,6 @@ async function confirm({ chain, sender, klima }: Context, id: bigint, hash: Hex,
   const retired = events.find((e) => e.eventName === "CarbonRetired")?.args;
   log.info("claim confirmed", { ...fields, ...completed, ...retired });
   return receipt.blockNumber;
-}
-
-async function blockAtLeast({ chain, pinned }: Context): Promise<bigint> {
-  const latest = await chain.client.getBlockNumber({ cacheTime: 0 });
-  return pinned !== undefined && latest < pinned ? pinned : latest;
 }
 
 async function readKlima(chain: Chain): Promise<Klima> {

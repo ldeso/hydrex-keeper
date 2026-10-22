@@ -315,8 +315,7 @@ export async function lastBlocks(run: Run, flip: bigint, conduits: { klima: bool
     const { readAt, time, vote } = base;
     if (!vote) return base;
     if (Number(lastVoted) * 1000 >= time) return { ...base, note: "already voted in this block" };
-    const reusable = best?.prepared && best.time === time && same(best.vote, vote) && same(best.rival, rival?.vote);
-    if (reusable) return { ...best, readAt, answered: base.answered };
+    if (reusable(best, base, lastVoted, rival?.vote)) return { ...best!, readAt, answered: base.answered };
     const target = { time: BigInt(Math.floor(time / 1000)), lastVoted };
     const prepared = await prepareVote(chain, signer, vote, dryRun, target, sender, rival);
     return { ...base, prepared, rival: rival?.vote };
@@ -579,6 +578,17 @@ export async function outcome(
   });
   return failures;
 }
+
+/**
+ * Whether the vote prepared for `best` stands for `plan`: for the same block and votes, after the same `rival` vote, and
+ * decided on the same last vote on chain, `lastVoted`. A vote that landed since may have taken its nonce.
+ */
+export const reusable = (best: Plan | undefined, { time, vote }: Plan, lastVoted: bigint, rival?: Vote) =>
+  !!best?.prepared &&
+  best.time === time &&
+  best.prepared.lastVoted === lastVoted &&
+  same(best.vote, vote) &&
+  same(best.rival, rival);
 
 const same = (a: Vote | null | undefined, b: Vote | null | undefined) =>
   a === b || (!!a && !!b && a.pools.join() === b.pools.join() && a.weights.join() === b.weights.join());

@@ -31,14 +31,14 @@ const SENDS = { claims: "claims", "day before": "vote of a day before the flip",
  * vote is in (`recheck`). With nothing due, `exit` is the exit code: a retry succeeds, since the attempt that was due
  * already failed, and alerted, for what is wrong, and failing again would only start another retry that ends here
  * too; a first attempt fails, so that a schedule that misses its window alerts. Throws if what is sent by hand could
- * take the nonce of what the schedule sends at the same time; a dry run sends nothing.
+ * take the nonce of what the schedule sends meanwhile, claims sending for HORIZON; a dry run sends nothing.
  */
 export function task(
   flip: bigint,
   at: bigint,
   { now, claim, dryRun, retry }: Start,
 ): { what: Due; recheck: boolean } | { what: undefined; exit: 0 | 1 } {
-  const scheduled = due(flip, at);
+  const scheduled = due(flip, at) ?? (claim ? due(flip, at + HORIZON) : undefined);
   const byHand = claim ? "--claim" : now ? "--now" : undefined;
   if (byHand && scheduled && !dryRun) {
     throw new Error(`${byHand} would race the scheduled ${SENDS[scheduled]}: run it later`);

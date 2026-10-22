@@ -24,6 +24,8 @@ const TIMEOUT_MS = 5_000;
 const BULK_TIMEOUT_MS = 30_000;
 const BLOCK_SECONDS = 2n; // on Base
 
+export const WETH: Address = "0x4200000000000000000000000000000000000006";
+
 export const now = () => BigInt(Math.floor(Date.now() / 1000));
 
 export const lower = (address: Address) => address.toLowerCase() as Address;
@@ -217,6 +219,12 @@ const reverted = (error: unknown, { address }: Call) =>
   error.contractAddress !== undefined &&
   isAddressEqual(error.contractAddress, address) &&
   error.walk((e) => e instanceof ContractFunctionRevertedError) !== null;
+
+/** The latest block, or `pinned` while the node is behind it: such a node would not see a transaction in `pinned`. */
+export async function blockAtLeast({ client }: Chain, pinned?: bigint): Promise<bigint> {
+  const latest = await client.getBlockNumber({ cacheTime: 0 });
+  return pinned !== undefined && latest < pinned ? pinned : latest;
+}
 
 /**
  * The number of the last block before `time` (s): estimated from the latest block, then checked with the block after

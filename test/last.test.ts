@@ -3,7 +3,18 @@ import { test, type TestContext } from "node:test";
 import { TransactionReceiptNotFoundError, zeroAddress, type Address, type Hex } from "viem";
 import { Blocks, sleep, watch } from "../src/blocks.ts";
 import { lastBlockBefore, type Chain as Connection, type Client } from "../src/chain.ts";
-import { keep, landed, outcome, pick, race, refreshed, v2Answered, type Lane, type Plan } from "../src/last.ts";
+import {
+  keep,
+  landed,
+  outcome,
+  pick,
+  race,
+  refreshed,
+  reusable,
+  v2Answered,
+  type Lane,
+  type Plan,
+} from "../src/last.ts";
 import type { Run } from "../src/pass.ts";
 import { klimaSender, v2Sender, type Tx } from "../src/vote.ts";
 
@@ -456,4 +467,24 @@ test("whether each conduit voted this epoch is read again while the node is behi
   await assert.rejects(lastBlockBefore(lagging(1).chain.client, FLIP), /not past/);
   assert.equal(await drive(t, outcome(lagging(2), FLIP, [], [KLIMA])), 0, "read at the third try");
   assert.equal(await drive(t, outcome(lagging(3), FLIP, [], [KLIMA])), 1, "unread");
+});
+
+test("a prepared vote is reused only for the same block, votes and rival, and the same last vote on chain", () => {
+  const vote = { pools: [addr(1)], weights: [1n] };
+  const plan = (more: Partial<Plan> = {}): Plan => ({
+    readAt: 0,
+    time: flip - 1000,
+    vote,
+    note: "",
+    summary: {},
+    ...more,
+  });
+  const best = plan({ prepared: { tx: {} as Tx, from: addr(9), lastVoted: 5n } });
+  assert.equal(reusable(best, plan({ readAt: 500 }), 5n), true);
+  assert.equal(reusable(best, plan(), 7n), false, "a vote landed since, and may have taken its nonce");
+  assert.equal(reusable(best, plan({ time: flip - 3000 }), 5n), false, "another block");
+  assert.equal(reusable(best, plan({ vote: { pools: [addr(2)], weights: [1n] } }), 5n), false, "other votes");
+  assert.equal(reusable(best, plan(), 5n, vote), false, "checked after no rival vote");
+  assert.equal(reusable(plan(), plan(), 5n), false, "nothing prepared");
+  assert.equal(reusable(undefined, plan(), 5n), false);
 });

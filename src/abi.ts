@@ -40,6 +40,7 @@ export const immutableAbi = parseAbi([
   "function poolValue(address pool) view returns (uint256 usd)",
   "function pricedTokens(uint256 index) view returns (address token, address feed, uint256 maxAge, uint256 mul, uint256 div)",
   "function claim(uint256 tokenId, address[] feeAddresses, address[] bribeAddresses, address[] tokens) returns (uint256[] amounts)",
+  "function TREASURY() view returns (address)",
   "event VoteAccepted(uint256 indexed epoch, address indexed proposer, address[] pools, uint256[] weights, uint256 oldScore, uint256 newScore)",
   "event Claimed(uint256 indexed tokenId, address indexed owner, address indexed caller, address[] tokens, uint256[] amounts, uint256[] fees, uint256 previousClaimBlock)",
   "error SequencerDown()",
@@ -95,6 +96,39 @@ export const bribeAbi = parseAbi([
   "function earnedTokenId(uint256 tokenId, address token, uint48 timestamp) view returns (uint256)",
   "function tokenTimestamp(uint256 tokenId, address token) view returns (uint256)",
   "function firstBribeTimestamp() view returns (uint256)",
+]);
+
+// Source: safe-modules' AllowanceModule, version 1.0.0, and the Safe it is enabled on.
+export const allowanceAbi = parseAbi([
+  "function getTokenAllowance(address safe, address delegate, address token) view returns (uint256[5])",
+  "function executeAllowanceTransfer(address safe, address token, address to, uint96 amount, address paymentToken, uint96 payment, address delegate, bytes signature)",
+]);
+
+export const safeAbi = parseAbi(["function isModuleEnabled(address module) view returns (bool)"]);
+
+// Uniswap's SwapRouter02 and QuoterV2.
+export const uniswapRouterAbi = parseAbi([
+  "struct ExactInputSingleParams { address tokenIn; address tokenOut; uint24 fee; address recipient; uint256 amountIn; uint256 amountOutMinimum; uint160 sqrtPriceLimitX96; }",
+  "function exactInputSingle(ExactInputSingleParams params) payable returns (uint256 amountOut)",
+  "function unwrapWETH9(uint256 amountMinimum, address recipient) payable",
+  "function multicall(uint256 deadline, bytes[] data) payable returns (bytes[] results)",
+]);
+
+export const uniswapQuoterAbi = parseAbi([
+  "struct QuoteExactInputSingleParams { address tokenIn; address tokenOut; uint256 amountIn; uint24 fee; uint160 sqrtPriceLimitX96; }",
+  "function quoteExactInputSingle(QuoteExactInputSingleParams params) returns (uint256 amountOut, uint160 sqrtPriceX96After, uint32 initializedTicksCrossed, uint256 gasEstimate)",
+]);
+
+// Aero's Slipstream SwapRouter and Metaquoter.
+export const aeroRouterAbi = parseAbi([
+  "struct ExactInputSingleParams { address tokenIn; address tokenOut; int24 tickSpacing; address recipient; uint256 deadline; uint256 amountIn; uint256 amountOutMinimum; uint160 sqrtPriceLimitX96; }",
+  "function exactInputSingle(ExactInputSingleParams params) payable returns (uint256 amountOut)",
+  "function unwrapWETH9(uint256 amountMinimum, address recipient) payable",
+  "function multicall(bytes[] data) payable returns (bytes[] results)",
+]);
+
+export const aeroQuoterAbi = parseAbi([
+  "function quoteExactInputSingleV3(address pool, address tokenIn, uint256 amountIn, uint160 sqrtPriceLimitX96) returns (uint256 amountOut, uint160 sqrtPriceX96After, uint32 initializedTicksCrossed)",
 ]);
 
 // Carbonmark's retirement aggregator.
