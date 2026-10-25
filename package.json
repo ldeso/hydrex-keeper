@@ -16,7 +16,7 @@
     "typecheck": "tsc"
   },
   "dependencies": {
-    "viem": "2.57.7"
+    "viem": "2.57.8"
   },
   "devDependencies": {
     "@types/node": "26.6.5",
