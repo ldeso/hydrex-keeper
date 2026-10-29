@@ -1,6 +1,6 @@
 {
   "name": "hydrex-keeper",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "description": "Weekly Hydrex vote through KlimaVeTokenConduitExecutor, signed by a Cloud KMS key",
   "license": "MIT",
