@@ -8,13 +8,14 @@ import {
   isAddressEqual,
   keccak256,
   shouldThrow,
+  type Abi,
   type Address,
   type Hex,
   type Transport,
 } from "viem";
 import { base } from "viem/chains";
 import { publicActionsL2 } from "viem/op-stack";
-import { conduitAbi, moduleAbi, voterAbi } from "./abi.ts";
+import { klimaAbi, immutableAbi, klimaModuleAbi, voterAbi } from "./abi.ts";
 import { errorMessage, log } from "./log.ts";
 
 export const WEEK = 7n * 24n * 60n * 60n;
@@ -22,11 +23,26 @@ export const CHUNK = 1_000; // calls per eth_call. publicnode accepts 1,132 and 
 export const HEDGE_DELAY_MS = 250; // a healthy node answers a read in about 125 ms
 const TIMEOUT_MS = 5_000;
 const BULK_TIMEOUT_MS = 30_000;
-const BLOCK_SECONDS = 2n;
+const LOOKUP_TIMEOUT_MS = 2_000;
+export const BLOCK_MS = 200; // Base's block time
 
 export const WETH: Address = "0x4200000000000000000000000000000000000006";
 
 export const now = () => BigInt(Math.floor(Date.now() / 1000));
+
+/**
+ * A block's time in ms. Five blocks share each second of `timestamp`, and RPCs give the full time as `timestampMs`,
+ * which viem passes on as it came.
+ */
+export function msOf(block: object): number | undefined {
+  const { timestampMs } = block as { timestampMs?: unknown };
+  if (typeof timestampMs !== "string") return undefined;
+  try {
+    return Number(BigInt(timestampMs));
+  } catch {
+    return undefined;
+  }
+}
 
 export const lower = (address: Address) => address.toLowerCase() as Address;
 
@@ -113,6 +129,35 @@ export function broadcaster(rpcUrls: string[]) {
   };
 }
 
+/**
+ * Whether a node has any of the transactions, pending or in a block, asking every URL. A node keeps each transaction it
+ * forwarded to the sequencer until the transaction lands or is dropped, and transactions are sent to every URL, so when
+ * the nodes that answer have none, none can land. Undefined when no node answered.
+ */
+export function finder(rpcUrls: string[]) {
+  const nodes = rpcUrls.map((url) => http(url));
+  return async (hashes: readonly Hex[]): Promise<boolean | undefined> => {
+    if (hashes.length === 0) return false;
+    const asks = nodes.flatMap((transport) => {
+      const node = transport({ chain: base, retryCount: 0, timeout: LOOKUP_TIMEOUT_MS });
+      return hashes.map((hash) => node.request({ method: "eth_getTransactionByHash", params: [hash] }));
+    });
+    return new Promise((resolve) => {
+      let settled = 0;
+      let answered = false;
+      for (const ask of asks) {
+        ask
+          .then((tx) => {
+            answered = true;
+            if (tx !== null) resolve(true);
+          })
+          .catch(() => undefined)
+          .finally(() => ++settled === asks.length && resolve(answered ? false : undefined));
+      }
+    });
+  };
+}
+
 function makeClient(transport: Transport) {
   const client = createPublicClient({ chain: base, transport, pollingInterval: 1_000 });
   return client.extend(publicActionsL2());
@@ -126,39 +171,190 @@ const bulkTransport = (rpcUrls: string[]) =>
     { retryCount: 0 },
   );
 
+/** The two conduits the job votes and claims for, named after their contracts. */
+export const CONDUITS = ["klima", "immutable"] as const;
+
+export type ConduitName = (typeof CONDUITS)[number];
+
+/** One value for each conduit. */
+export type ByConduit<T> = { [name in ConduitName]: T };
+
+export const byConduit = <T>(make: (name: ConduitName) => T): ByConduit<T> => ({
+  klima: make("klima"),
+  immutable: make("immutable"),
+});
+
+export const otherOf = (name: ConduitName): ConduitName => (name === "klima" ? "immutable" : "klima");
+
+/** What sets a conduit apart, from its contracts. */
+export type Traits = {
+  /** For logs and errors: "the Klima conduit", "the immutable conduit". */
+  label: string;
+  /** Its key's role on chain. */
+  role: "keeper" | "proposer";
+  /** The conduit's ABI, for calls to its address. */
+  abi: Abi;
+  /** The ABI of `to`, where its key's votes and claims go. */
+  toAbi: Abi;
+  /** Anyone can vote for an open conduit, so a vote in force may not be its key's. */
+  open: boolean;
+  /**
+   * Whether it checks votes on chain: it only takes a vote whose score, counted in the tokens it prices with, beats the
+   * vote in force.
+   */
+  checks: boolean;
+  /** The most pools in a vote. */
+  maxPools: number;
+  /** What it does with the rewards it claims. */
+  payout: "retire" | "as is";
+  /** Rough gas of a claim before its swaps and pairs. The simulation has the final say. */
+  claimGas: bigint;
+  /** Owners whose veNFTs it doesn't claim for, by lowercase address. */
+  excludedOwners: ReadonlyMap<string, string>;
+  /** Whether its treasury pays for both keys' ETH. One conduit's does. */
+  fundsKeys: boolean;
+};
+
+export const TRAITS: ByConduit<Traits> = {
+  klima: {
+    label: "the Klima conduit",
+    role: "keeper", // its Safe module's KEEPER
+    abi: klimaAbi,
+    toAbi: klimaModuleAbi,
+    open: false,
+    checks: false,
+    maxPools: 40, // more pools could go over Base's gas limit per transaction
+    payout: "retire", // swaps rewards to kVCM, retires part of it and pays out the rest
+    claimGas: 1_300_000n,
+    excludedOwners: new Map([["0xa79cd47655156b299762dfe92a67980805ce5a31", "Klima Foundation"]]),
+    fundsKeys: false,
+  },
+  immutable: {
+    label: "the immutable conduit",
+    role: "proposer", // anyone can propose its vote
+    abi: immutableAbi,
+    toAbi: immutableAbi,
+    open: true,
+    checks: true,
+    maxPools: 20, // the conduit's MAX_POOLS
+    payout: "as is", // minus its fee
+    claimGas: 400_000n,
+    excludedOwners: new Map(),
+    fundsKeys: true,
+  },
+};
+
+/** Where a conduit is, and the key that votes and claims for it. */
+export type Place = {
+  /** What the Voter records the conduit's votes for. */
+  address: Address;
+  /** The key's address. */
+  from: Address;
+  /** Where the key's votes and claims go: the Klima conduit's Safe module, or the immutable conduit itself. */
+  to: Address;
+  /** For a conduit that checks votes on chain: the tokens it prices with. Empty for the others. */
+  priced: Address[];
+};
+
+export type Conduit = Traits &
+  Place & {
+    name: ConduitName;
+    /**
+     * The conduit's own client for its transactions. Calls sent together through one client share a JSON-RPC batch,
+     * which only answers when its slowest call does.
+     */
+    client: Client;
+  };
+
+/** The conduit `name` at `place`, with its traits. */
+export const conduitOf = (name: ConduitName, place: Place, client: Client): Conduit => ({
+  name,
+  ...TRAITS[name],
+  ...place,
+  client,
+});
+
 export type Chain = {
+  /** For reads. */
   client: Client;
   /** For slow, heavy reads, which go to one URL at a time instead of being hedged. */
   bulk: Client;
-  /**
-   * A separate client for the immutable conduit's votes. Calls sent together through one client share a JSON-RPC batch,
-   * which only answers when its slowest call does.
-   */
-  v2Client: Client;
   broadcast: ReturnType<typeof broadcaster>;
-  module: Address;
-  conduit: Address;
-  keeper: Address;
+  known: ReturnType<typeof finder>;
   voter: Address;
   ve: Address;
-  v2?: V2 | undefined;
+  conduits: ByConduit<Conduit>;
 };
 
-export type V2 = { conduit: Address; proposer: Address; priced: Address[] };
+/** Where to find each conduit: the Klima conduit through its Safe module, the immutable conduit directly. */
+export type Settings = { klima: { module: Address }; immutable: { conduit: Address; proposer: Address } };
 
-export async function connect(module: Address, rpcUrls: string[]): Promise<Chain> {
+const MAX_PRICED_TOKENS = 4; // a checking conduit's limit
+
+export async function connect(settings: Settings, rpcUrls: string[]): Promise<Chain> {
   const client = makeClient(hedged(rpcUrls));
-  const [conduit, keeper] = (await readMany<Address>(client, [
-    call(module, moduleAbi, "CONDUIT"),
-    call(module, moduleAbi, "KEEPER"),
+  const { voter, ve, places } = await readAddresses(client, settings);
+  return {
+    client,
+    bulk: makeClient(bulkTransport(rpcUrls)),
+    broadcast: broadcaster(rpcUrls),
+    known: finder(rpcUrls),
+    voter,
+    ve,
+    conduits: byConduit((name) => conduitOf(name, places[name], makeClient(hedged(rpcUrls)))),
+  };
+}
+
+/**
+ * Where both conduits and their keys are. The Klima conduit and its keeper are read from its Safe module, and a
+ * checking conduit's priced tokens from it. Both conduits must use the same Voter and VotingEscrow, and the two keys must
+ * differ: they send at the same time, and their nonces are tracked separately.
+ */
+export async function readAddresses(
+  client: Client,
+  { klima, immutable }: Settings,
+): Promise<{ voter: Address; ve: Address; places: ByConduit<Place> }> {
+  const [klimaConduit, keeper] = (await readMany<Address>(client, [
+    call(klima.module, klimaModuleAbi, "CONDUIT"),
+    call(klima.module, klimaModuleAbi, "KEEPER"),
   ])) as [Address, Address];
-  const [voter, ve] = (await readMany<Address>(client, [
-    call(conduit, conduitAbi, "voter"),
-    call(conduit, conduitAbi, "veToken"),
-  ])) as [Address, Address];
-  const bulk = makeClient(bulkTransport(rpcUrls));
-  const v2Client = makeClient(hedged(rpcUrls));
-  return { client, bulk, v2Client, broadcast: broadcaster(rpcUrls), module, conduit, keeper, voter, ve };
+  if (isAddressEqual(immutable.proposer, keeper)) {
+    throw new Error(`IMMUTABLE_PROPOSER is the KEEPER of KLIMA_MODULE, ${keeper}: each conduit needs a key of its own`);
+  }
+  const located: ByConduit<Omit<Place, "priced">> = {
+    klima: { address: klimaConduit, from: keeper, to: klima.module },
+    immutable: { address: immutable.conduit, from: immutable.proposer, to: immutable.conduit },
+  };
+  const conduitCall = (name: ConduitName, functionName: string, args?: readonly unknown[]) =>
+    call(located[name].address, TRAITS[name].abi, functionName, args);
+  const checking = CONDUITS.filter((name) => TRAITS[name].checks);
+  const pricedCalls = checking.flatMap((name) =>
+    Array.from({ length: MAX_PRICED_TOKENS }, (_, i) => conduitCall(name, "pricedTokens", [BigInt(i)])),
+  );
+  const [used, entries] = await Promise.all([
+    readMany<Address>(
+      client,
+      CONDUITS.flatMap((name) => [conduitCall(name, "voter"), conduitCall(name, "veToken")]),
+    ),
+    readEach<readonly [Address, ...unknown[]]>(client, pricedCalls),
+  ]);
+  const [voter, ve] = used as [Address, Address];
+  for (const [i, name] of CONDUITS.entries()) {
+    const [otherVoter, otherVe] = used.slice(2 * i) as [Address, Address];
+    if (!isAddressEqual(otherVoter, voter) || !isAddressEqual(otherVe, ve)) {
+      const { address } = located[name];
+      throw new Error(`${address} uses Voter ${otherVoter} and VotingEscrow ${otherVe}, not ${voter} and ${ve}`);
+    }
+  }
+  const places = byConduit((name): Place => {
+    const k = checking.indexOf(name);
+    if (k < 0) return { ...located[name], priced: [] };
+    const own = entries.slice(k * MAX_PRICED_TOKENS, (k + 1) * MAX_PRICED_TOKENS);
+    const priced = own.flatMap((entry) => (entry ? [entry[0]] : []));
+    if (priced.length === 0) throw new Error(`${located[name].address} prices no token`);
+    return { ...located[name], priced };
+  });
+  return { voter, ve, places };
 }
 
 export type Call = { address: Address; abi: readonly unknown[]; functionName: string; args?: readonly unknown[] };
@@ -177,7 +373,6 @@ export const voterCall = ({ voter }: Chain, functionName: string, args?: readonl
 
 type ReadOptions = {
   blockNumber?: bigint;
-  blockTag?: "pending" | undefined;
   chunk?: number;
   concurrency?: number;
 };
@@ -216,43 +411,44 @@ export async function blockAtLeast({ client }: Chain, pinned?: bigint): Promise<
   return pinned !== undefined && latest < pinned ? pinned : latest;
 }
 
-export async function lastBlockBefore(client: Client, time: bigint): Promise<bigint> {
+type Head = { number: bigint; timestamp: bigint };
+
+/** The first and last blocks whose timestamps lie in [`from`, `to`), both found from one read of the latest block. */
+export async function blocksBetween(client: Client, from: bigint, to: bigint): Promise<[bigint, bigint]> {
   const head = await client.getBlock();
+  const [before, last] = await Promise.all([lastBlockBefore(client, from, head), lastBlockBefore(client, to, head)]);
+  return [before + 1n, last];
+}
+
+/**
+ * The last block before `time` (s), worked out from the latest block's time, since blocks come every BLOCK_MS. The
+ * blocks either side of `time` are read to confirm it, and the lookup fails rather than give another block.
+ */
+export async function lastBlockBefore(client: Client, time: bigint, latest?: Head): Promise<bigint> {
+  const head = latest ?? (await client.getBlock());
   if (head.timestamp < time) throw new Error(`the latest block, at ${head.timestamp}, is not past ${time} yet`);
-  const before = async (blockNumber: bigint) => (await client.getBlock({ blockNumber })).timestamp < time;
-  const estimate = head.number - (head.timestamp - time) / BLOCK_SECONDS - 1n;
-  let lo = estimate < 0n ? 0n : estimate < head.number ? estimate : head.number - 1n;
-  let hi = lo + 1n;
-  const [loBefore, hiBefore] = await Promise.all([before(lo), before(hi)]);
-  if (!loBefore) {
-    for (let step = 1n; ; step *= 2n) {
-      hi = lo;
-      lo = hi > step ? hi - step : 0n;
-      if (await before(lo)) break;
-      if (lo === 0n) throw new Error(`no block before ${time}`);
-    }
-  } else if (hiBefore) {
-    for (let step = 1n; ; step *= 2n) {
-      lo = hi;
-      hi = lo + step < head.number ? lo + step : head.number;
-      if (!(await before(hi))) break;
-    }
+  const ms = msOf(head);
+  if (ms === undefined) throw new Error(`block ${head.number} has no timestampMs`);
+  const found = head.number - (BigInt(ms) - time * 1000n) / BigInt(BLOCK_MS) - 1n;
+  const [block, next] = await Promise.all([
+    client.getBlock({ blockNumber: found }),
+    client.getBlock({ blockNumber: found + 1n }),
+  ]);
+  if (block.timestamp >= time || next.timestamp < time) {
+    throw new Error(
+      `blocks ${found} and ${found + 1n}, at ${block.timestamp} and ${next.timestamp}, are not either side of ${time}`,
+    );
   }
-  while (hi - lo > 1n) {
-    const mid = (lo + hi) / 2n;
-    if (await before(mid)) lo = mid;
-    else hi = mid;
-  }
-  return lo;
+  return found;
 }
 
 async function multicall(
   client: Client,
   calls: readonly Call[],
   allowFailure: boolean,
-  { blockNumber, blockTag, chunk = CHUNK, concurrency = Infinity }: ReadOptions,
+  { blockNumber, chunk = CHUNK, concurrency = Infinity }: ReadOptions,
 ): Promise<unknown[]> {
-  const at = blockNumber !== undefined ? { blockNumber } : blockTag ? { blockTag } : {};
+  const at = blockNumber !== undefined ? { blockNumber } : {};
   const chunks = Array.from({ length: Math.ceil(calls.length / chunk) }, (_, i) =>
     calls.slice(i * chunk, (i + 1) * chunk),
   );

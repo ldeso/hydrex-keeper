@@ -11,9 +11,8 @@ MAX_RETRIES=3
 # Cloud Scheduler retries a failed start after 15, 30 and 60 s, all within 5 minutes and before the job has work to do.
 SCHEDULER_RETRY_FLAGS="--max-retry-attempts=3 --min-backoff=15s --max-backoff=60s --max-doublings=2 --max-retry-duration=300s"
 ALERT_METRIC=run.googleapis.com/job/completed_task_attempt_count
-MIN_KEEPER_WEI=2000000000000000   # 0.002 ETH, so that check.sh fails before claims stop at 0.001 ETH
-MIN_PROPOSER_WEI=2000000000000000 # 0.002 ETH, so that check.sh fails before claims stop or a vote in busy blocks fails
-# The same as PUBLIC_RPCS in src/main.ts.
+MIN_KEY_WEI=2000000000000000 # 0.002 ETH in each conduit's key, so that check.sh fails before claims or votes stop
+# The same as PUBLIC_RPCS in src/config.ts.
 PUBLIC_RPCS="https://mainnet.base.org https://base.drpc.org https://base-rpc.publicnode.com"
 
 REPO_ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
@@ -61,37 +60,30 @@ require_tools() {
 load_config() {
   [ -f "$CONFIG_FILE" ] || die "$CONFIG_FILE missing; copy config.env.example"
   case "$CONFIG_FILE" in */*) ;; *) CONFIG_FILE=./$CONFIG_FILE ;; esac # so that `.` doesn't search PATH
-  unset KEEPER_PROJECT REGION JOB KEEPER_SA_NAME SCHEDULER_SA_NAME KMS_KEY_VERSION MODULE RPC_SECRET ALCHEMY_SECRET \
-    COINGECKO_SECRET ALERT_EMAIL CONDUIT PROPOSER PROPOSER_KMS_KEY_VERSION
+  unset KEEPER_PROJECT REGION JOB KEEPER_SA_NAME SCHEDULER_SA_NAME KLIMA_MODULE KLIMA_KMS_KEY_VERSION \
+    IMMUTABLE_CONDUIT IMMUTABLE_PROPOSER IMMUTABLE_KMS_KEY_VERSION RPC_SECRET ALCHEMY_SECRET COINGECKO_SECRET ALERT_EMAIL
   # shellcheck source=/dev/null
   . "$CONFIG_FILE"
   REGION=${REGION:-us-central1}
   JOB=${JOB:-hydrex-keeper}
   KEEPER_SA_NAME=${KEEPER_SA_NAME:-hydrex-keeper}
   SCHEDULER_SA_NAME=${SCHEDULER_SA_NAME:-hydrex-keeper-scheduler}
-  MODULE=${MODULE:-0x750973E0CB728C3112561Bc8E9b235afA9B17E81}
   RPC_SECRET=${RPC_SECRET:-base-rpc-url}
   ALCHEMY_SECRET=${ALCHEMY_SECRET:-alchemy-api-key}
   COINGECKO_SECRET=${COINGECKO_SECRET:-}
-  CONDUIT=${CONDUIT:-}
-  PROPOSER=${PROPOSER:-}
-  PROPOSER_KMS_KEY_VERSION=${PROPOSER_KMS_KEY_VERSION:-}
 
-  for required in KEEPER_PROJECT KMS_KEY_VERSION ALERT_EMAIL; do
+  for required in KEEPER_PROJECT KLIMA_MODULE KLIMA_KMS_KEY_VERSION IMMUTABLE_CONDUIT IMMUTABLE_PROPOSER \
+    IMMUTABLE_KMS_KEY_VERSION ALERT_EMAIL; do
     eval "value=\${$required:-}"
     [ -n "$value" ] || die "$required is not set in $CONFIG_FILE"
   done
-  require_key_version KMS_KEY_VERSION "$KMS_KEY_VERSION"
-  require_address MODULE "$MODULE"
-  if [ -n "$CONDUIT$PROPOSER$PROPOSER_KMS_KEY_VERSION" ]; then
-    [ -n "$CONDUIT" ] && [ -n "$PROPOSER" ] && [ -n "$PROPOSER_KMS_KEY_VERSION" ] ||
-      die "CONDUIT, PROPOSER and PROPOSER_KMS_KEY_VERSION go together"
-    require_address CONDUIT "$CONDUIT"
-    require_address PROPOSER "$PROPOSER"
-    require_key_version PROPOSER_KMS_KEY_VERSION "$PROPOSER_KMS_KEY_VERSION"
-    [ "${PROPOSER_KMS_KEY_VERSION%/cryptoKeyVersions/*}" != "${KMS_KEY_VERSION%/cryptoKeyVersions/*}" ] ||
-      die "the proposer needs its own key, not the keeper's"
-  fi
+  require_address KLIMA_MODULE "$KLIMA_MODULE"
+  require_key_version KLIMA_KMS_KEY_VERSION "$KLIMA_KMS_KEY_VERSION"
+  require_address IMMUTABLE_CONDUIT "$IMMUTABLE_CONDUIT"
+  require_address IMMUTABLE_PROPOSER "$IMMUTABLE_PROPOSER"
+  require_key_version IMMUTABLE_KMS_KEY_VERSION "$IMMUTABLE_KMS_KEY_VERSION"
+  [ "${IMMUTABLE_KMS_KEY_VERSION%/cryptoKeyVersions/*}" != "${KLIMA_KMS_KEY_VERSION%/cryptoKeyVersions/*}" ] ||
+    die "each conduit needs a key of its own"
   case "$ALERT_EMAIL" in
     ?*@?*) ;;
     *) die "ALERT_EMAIL must be an email address" ;;
@@ -104,10 +96,9 @@ load_config() {
   # Thursday 00:00 flip. See src/schedule.ts.
   SCHEDULE="50 23 * * 2,3"
   # Sorted by name, because that is how check.sh reads them back.
-  ENV_VARS="KMS_KEY_VERSION=$KMS_KEY_VERSION,MODULE=$MODULE"
-  if [ -n "$CONDUIT" ]; then
-    ENV_VARS="CONDUIT=$CONDUIT,$ENV_VARS,PROPOSER=$PROPOSER,PROPOSER_KMS_KEY_VERSION=$PROPOSER_KMS_KEY_VERSION"
-  fi
+  ENV_VARS="IMMUTABLE_CONDUIT=$IMMUTABLE_CONDUIT,IMMUTABLE_KMS_KEY_VERSION=$IMMUTABLE_KMS_KEY_VERSION"
+  ENV_VARS="$ENV_VARS,IMMUTABLE_PROPOSER=$IMMUTABLE_PROPOSER"
+  ENV_VARS="$ENV_VARS,KLIMA_KMS_KEY_VERSION=$KLIMA_KMS_KEY_VERSION,KLIMA_MODULE=$KLIMA_MODULE"
   SECRETS="ALCHEMY_API_KEY=$ALCHEMY_SECRET:latest,BASE_RPC_URLS=$RPC_SECRET:latest"
   SECRET_NAMES="$RPC_SECRET $ALCHEMY_SECRET"
   if [ -n "$COINGECKO_SECRET" ]; then
@@ -219,12 +210,4 @@ rpc() {
     log "$1 failed on $rpc_url: $rpc_reply"
   done
   die "$1 failed on every public Base node"
-}
-
-# Older versions named their scheduler jobs $JOB-*. Call this as x=$(stale_schedulers), so that a failed listing
-# stops the script.
-stale_schedulers() {
-  stale_list=$(gcloud scheduler jobs list --location="$REGION" --project="$KEEPER_PROJECT" --format=json) || die "cannot list scheduler jobs"
-  require_json "$stale_list" "scheduler job list"
-  printf '%s\n' "$stale_list" | jq -r --arg job "$JOB" '[.[].name | split("/") | last | select(startswith($job + "-"))] | join(" ")'
 }

@@ -59,8 +59,6 @@ if scheduler=$(describe_scheduler "$JOB"); then
 else
   fail "scheduler job $JOB not found; run deploy.sh"
 fi
-stale=$(stale_schedulers)
-if [ -z "$stale" ]; then ok "no stale scheduler job"; else fail "stale scheduler jobs: $stale"; fi
 
 for secret in $SECRET_NAMES; do
   if has_version "$secret"; then ok "$secret has an enabled version"; else fail "$secret has no enabled version"; fi
@@ -94,11 +92,12 @@ check_balance() {
   fi
 }
 
-# 0x862a179e calls the module's KEEPER().
-keeper=$(rpc eth_call "[{\"to\":\"$MODULE\",\"data\":\"0x862a179e\"},\"latest\"]")
+# Each conduit's key: the Klima conduit's keeper, which 0x862a179e reads as the module's KEEPER(), and the immutable
+# conduit's proposer.
+keeper=$(rpc eth_call "[{\"to\":\"$KLIMA_MODULE\",\"data\":\"0x862a179e\"},\"latest\"]")
 keeper=0x$(printf '%s' "$keeper" | tail -c 40)
-check_balance keeper "$keeper" "$MIN_KEEPER_WEI"
-[ -z "$PROPOSER" ] || check_balance proposer "$PROPOSER" "$MIN_PROPOSER_WEI"
+check_balance keeper "$keeper" "$MIN_KEY_WEI"
+check_balance proposer "$IMMUTABLE_PROPOSER" "$MIN_KEY_WEI"
 
 channel=$(find_channel "$KEEPER_PROJECT")
 [ -n "$channel" ] || fail "no email channel for $ALERT_EMAIL"

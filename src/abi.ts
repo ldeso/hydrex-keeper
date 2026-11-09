@@ -1,6 +1,7 @@
 import { parseAbi } from "viem";
 
-export const moduleAbi = parseAbi([
+// KlimaVeTokenConduitExecutor, the Klima conduit's Safe module.
+export const klimaModuleAbi = parseAbi([
   "function CONDUIT() view returns (address)",
   "function KEEPER() view returns (address)",
   "function vote(address[] pools, uint256[] weights)",
@@ -15,7 +16,8 @@ export const moduleAbi = parseAbi([
   "error InsufficientVotingPower()",
 ]);
 
-export const conduitAbi = parseAbi([
+// KlimaVeTokenConduit.
+export const klimaAbi = parseAbi([
   "function voter() view returns (address)",
   "function veToken() view returns (address)",
   "function kvcm() view returns (address)",
@@ -55,7 +57,6 @@ export const immutableAbi = parseAbi([
   "error NoRewardContracts()",
   "error TokenCallFailed(address token)",
   "error Reentrancy()",
-  // Errors from the Voter, which the conduit passes on.
   "error EpochFlipInProgress()",
   "error VoteDelayNotMet()",
   "error InsufficientVotingPower()",
@@ -73,6 +74,9 @@ export const voterAbi = parseAbi([
   "function votes(address voter, address pool) view returns (uint256)",
   "function poolVote(address voter, uint256 index) view returns (address)",
   "function lastVoted(address voter) view returns (uint256)",
+  "function vote(address[] poolVote, uint256[] voteProportions)",
+  "function poke()",
+  "event Voted(address indexed voter, uint256 weight)",
 ]);
 
 export const veAbi = parseAbi([

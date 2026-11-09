@@ -1,7 +1,6 @@
 gcloud run jobs describe hydrex-keeper --region=us-central1 --project=hydrex-keeper-test --format=json
 gcloud run jobs get-iam-policy --region=us-central1 --project=hydrex-keeper-test hydrex-keeper --format=json
 gcloud scheduler jobs describe hydrex-keeper --location=us-central1 --project=hydrex-keeper-test --format=json
-gcloud scheduler jobs list --location=us-central1 --project=hydrex-keeper-test --format=json
 gcloud secrets versions list base-rpc-url --project=hydrex-keeper-test --format=json
 gcloud secrets get-iam-policy --project=hydrex-keeper-test base-rpc-url --format=json
 gcloud secrets versions list alchemy-api-key --project=hydrex-keeper-test --format=json
@@ -22,7 +21,7 @@ ok: job task timeout is 5400
 ok: job max retries is 3
 ok: job task count is 1
 ok: job containers is 1
-FAIL: job env is KMS_KEY_VERSION=projects/hydrex-keeper-key-test/locations/us/keyRings/hydrex-keeper/cryptoKeys/hydrex-keeper-v1/cryptoKeyVersions/1,MODULE=0x750973E0CB728C3112561Bc8E9b235afA9B17E81, expected CONDUIT=0x692c323B425A9DfeebE302F56168a7798D93EAC5,KMS_KEY_VERSION=projects/hydrex-keeper-key-test/locations/us/keyRings/hydrex-keeper/cryptoKeys/hydrex-keeper-v1/cryptoKeyVersions/1,MODULE=0x750973E0CB728C3112561Bc8E9b235afA9B17E81,PROPOSER=0x000000000000000000000000000000000000bEEF,PROPOSER_KMS_KEY_VERSION=projects/hydrex-keeper-key-test/locations/us/keyRings/hydrex-keeper/cryptoKeys/hydrex-proposer-v1/cryptoKeyVersions/1
+FAIL: job env is KLIMA_KMS_KEY_VERSION=projects/hydrex-keeper-key-test/locations/us/keyRings/hydrex-keeper/cryptoKeys/hydrex-keeper-v1/cryptoKeyVersions/1,KLIMA_MODULE=0x750973E0CB728C3112561Bc8E9b235afA9B17E81, expected IMMUTABLE_CONDUIT=0x692c323B425A9DfeebE302F56168a7798D93EAC5,IMMUTABLE_KMS_KEY_VERSION=projects/hydrex-keeper-key-test/locations/us/keyRings/hydrex-keeper/cryptoKeys/hydrex-proposer-v1/cryptoKeyVersions/1,IMMUTABLE_PROPOSER=0x000000000000000000000000000000000000bEEF,KLIMA_KMS_KEY_VERSION=projects/hydrex-keeper-key-test/locations/us/keyRings/hydrex-keeper/cryptoKeys/hydrex-keeper-v1/cryptoKeyVersions/1,KLIMA_MODULE=0x750973E0CB728C3112561Bc8E9b235afA9B17E81
 ok: job secrets is ALCHEMY_API_KEY=alchemy-api-key:latest,BASE_RPC_URLS=base-rpc-url:latest
 ok: job IAM policy matches template
 ok: schedule is 50 23 * * 2,3
@@ -32,7 +31,6 @@ ok: schedule method is POST
 ok: schedule service account is hydrex-keeper-scheduler@hydrex-keeper-test.iam.gserviceaccount.com
 ok: schedule state is ENABLED
 ok: schedule retries is --max-retry-attempts=3 --min-backoff=15s --max-backoff=60s --max-doublings=2 --max-retry-duration=300s
-ok: no stale scheduler job
 ok: base-rpc-url has an enabled version
 ok: base-rpc-url IAM policy matches template
 ok: alchemy-api-key has an enabled version

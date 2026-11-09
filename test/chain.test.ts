@@ -3,16 +3,21 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { test } from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
-import { keccak256, type Hex } from "viem";
+import { keccak256, type Abi, type Address, type Hex } from "viem";
 import { base } from "viem/chains";
 import {
   broadcaster,
   CHUNK,
+  CONDUITS,
+  finder,
   HEDGE_DELAY_MS,
   hedged,
   hostOf,
+  blocksBetween,
   lastBlockBefore,
+  readAddresses,
   readMany,
+  TRAITS,
   type Call,
   type Client,
 } from "../src/chain.ts";
@@ -85,6 +90,23 @@ test("broadcast counts 'already known' as accepted, and fails only when no node 
       /^no RPC accepted the transaction: 127\.0\.0\.1:\d+: .*nonce too low.*; 127\.0\.0\.1:/s.test(e.message) &&
       !e.message.includes("secret-key"),
   );
+});
+
+test("a transaction is known while any node has it, and unknown only when no node answers", async (t) => {
+  const [held, mined, none, down] = [
+    await rpc(([hash]) => ({ hash, blockNumber: null })),
+    await rpc(([hash]) => ({ hash, blockNumber: "0x1" })),
+    await rpc(() => null),
+    await refuses("rate limited"),
+  ];
+  t.after(() => [held, mined, none, down].forEach((node) => node.close()));
+  const known = (...nodes: { url: string }[]) => finder(nodes.map((node) => node.url))([keccak256(signed)]);
+  assert.equal(await known(none, held, down), true, "a node holds it, pending");
+  assert.equal(await known(none, mined), true, "in a block");
+  assert.equal(await known(none, down), false, "the nodes that answer have none");
+  assert.equal(await known(down), undefined, "no node answers");
+  assert.equal(await finder([none.url])([]), false, "nothing to look for");
+  assert.deepEqual(none.received.at(-1), [keccak256(signed)], "asked by hash");
 });
 
 test("logs name an RPC by its host only: provider URLs carry their key", () => {
@@ -203,21 +225,115 @@ test("readMany can send smaller chunks, a few at a time, and still keeps their o
   );
 });
 
-test("the last block before a time is found whatever the block time, near the head or an hour back", async () => {
+/** A chain whose block n came `gap` ms after block n - 1, with block 40,000,000 the latest. */
+function blocksOf(gap: bigint, stamped = true) {
   const head = 40_000_000n;
-  for (const seconds of [1n, 2n, 5n]) {
-    const timeOf = (n: bigint) => 1_790_812_800n - seconds * (head - n);
-    const client = {
-      getBlock: async (args?: { blockNumber?: bigint }) => {
-        const number = args?.blockNumber ?? head;
-        assert.ok(number <= head, "no block past the latest");
-        return { number, timestamp: timeOf(number) };
-      },
-    } as unknown as Client;
-    for (const back of [0n, 1n, 9n, 3_600n, 3_601n]) {
-      const time = timeOf(head) - back;
-      const found = await lastBlockBefore(client, time);
-      assert.ok(timeOf(found) < time && timeOf(found + 1n) >= time, `${seconds} s blocks, ${back} s back: ${found}`);
-    }
+  const msOf = (n: bigint) => 1_790_812_800_400n - (head - n) * gap;
+  const counter = { reads: 0 };
+  const client = {
+    getBlock: async (args?: { blockNumber?: bigint }) => {
+      counter.reads++;
+      const number = args?.blockNumber ?? head;
+      assert.ok(number <= head, "no block past the latest");
+      const ms = msOf(number);
+      return { number, timestamp: ms / 1000n, ...(stamped ? { timestampMs: `0x${ms.toString(16)}` } : {}) };
+    },
+  } as unknown as Client;
+  return { client, counter, head, timeOf: (n: bigint) => msOf(n) / 1000n };
+}
+
+test("the last block before a time is worked out from the latest one's time, and checked against the blocks around it", async () => {
+  const { client, counter, head, timeOf } = blocksOf(200n);
+  for (const back of [0n, 1n, 9n, 3_600n, 86_400n]) {
+    const time = timeOf(head) - back;
+    counter.reads = 0;
+    const found = await lastBlockBefore(client, time);
+    assert.ok(timeOf(found) < time && timeOf(found + 1n) >= time, `${back} s back: ${found}`);
+    assert.equal(counter.reads, 3, "the latest block, the one found and the one after it");
   }
+  counter.reads = 0;
+  const second = timeOf(head) - 60n;
+  const [first, last] = await blocksBetween(client, second, second + 1n);
+  assert.deepEqual(
+    [timeOf(first - 1n), timeOf(first), timeOf(last), timeOf(last + 1n)],
+    [second - 1n, second, second, second + 1n],
+  );
+  assert.equal(last - first, 4n, "five blocks in a second");
+  assert.equal(counter.reads, 5, "one read of the latest block for both ends");
+});
+
+test("without timestampMs, or with blocks not 200 ms apart, the lookup fails rather than give another block", async () => {
+  const unstamped = blocksOf(200n, false);
+  await assert.rejects(lastBlockBefore(unstamped.client, unstamped.timeOf(unstamped.head) - 10n), /has no timestampMs/);
+  const slower = blocksOf(2_000n);
+  await assert.rejects(lastBlockBefore(slower.client, slower.timeOf(slower.head) - 10n), /are not either side of/);
+});
+
+test("both conduits are read once their keys are known to differ, and must share a Voter", async () => {
+  const addr = (n: number) => `0x${n.toString(16).padStart(40, "0")}` as Address;
+  const [MODULE, CONDUIT, KEEPER, VOTER, VE, IMMUTABLE, PROPOSER] = [1, 2, 3, 4, 5, 6, 7].map(addr) as [
+    Address,
+    Address,
+    Address,
+    Address,
+    Address,
+    Address,
+    Address,
+  ];
+  const clientOf = (immutableVoter: Address, priced = 4) => {
+    const reads: string[] = [];
+    const answer = ({ address, functionName, args }: Call): unknown => {
+      reads.push(functionName);
+      if (functionName === "CONDUIT") return CONDUIT;
+      if (functionName === "KEEPER") return KEEPER;
+      if (functionName === "voter") return address === IMMUTABLE ? immutableVoter : VOTER;
+      if (functionName === "veToken") return VE;
+      return Number(args![0]) < priced ? [addr(30 + Number(args![0])), addr(40), 0n] : undefined;
+    };
+    const client = {
+      multicall: async ({ contracts, allowFailure }: { contracts: Call[]; allowFailure: boolean }) =>
+        contracts.map((c) => {
+          const result = answer(c);
+          return allowFailure ? { status: "success", result } : result;
+        }),
+    } as unknown as Client;
+    return { client, reads };
+  };
+  const settings = (proposer: Address) => ({ klima: { module: MODULE }, immutable: { conduit: IMMUTABLE, proposer } });
+  const ok = clientOf(VOTER, 2);
+  const { voter, ve, places } = await readAddresses(ok.client, settings(PROPOSER));
+  assert.deepEqual([voter, ve], [VOTER, VE]);
+  assert.deepEqual(places, {
+    klima: { address: CONDUIT, from: KEEPER, to: MODULE, priced: [] },
+    immutable: { address: IMMUTABLE, from: PROPOSER, to: IMMUTABLE, priced: [addr(30), addr(31)] },
+  });
+  const sameKey = clientOf(VOTER);
+  await assert.rejects(
+    readAddresses(sameKey.client, settings(KEEPER)),
+    /^Error: IMMUTABLE_PROPOSER is the KEEPER of KLIMA_MODULE, 0x0+3: each conduit needs a key of its own$/,
+  );
+  assert.deepEqual(sameKey.reads, ["CONDUIT", "KEEPER"], "nothing more is read");
+  await assert.rejects(readAddresses(clientOf(addr(9)).client, settings(PROPOSER)), /uses Voter/);
+});
+
+test("each conduit's ABI has what the job calls on the conduit, by its traits, and its key's what the key sends", () => {
+  const names = (abi: Abi) => new Set(abi.flatMap((item) => ("name" in item ? [item.name] : [])));
+  for (const name of CONDUITS) {
+    const { abi, toAbi, checks, open, fundsKeys, payout } = TRAITS[name];
+    const retires = payout === "retire";
+    const called = [
+      "voter",
+      "veToken",
+      ...(checks ? ["pricedTokens", "poolValue", "currentScore"] : []),
+      ...(open ? ["VoteAccepted"] : []),
+      ...(fundsKeys ? ["TREASURY"] : []),
+      ...(retires ? ["kvcm", "retireBps", "isApprovedRouter", "distributionTokens", "CarbonRetired"] : []),
+    ];
+    const own = names(abi);
+    for (const fn of called) assert.ok(own.has(fn), `${name} conduit: ${fn}`);
+    const sent = names(toAbi);
+    for (const call of ["vote", retires ? "claimSwapAndDistribute" : "claim"])
+      assert.ok(sent.has(call), `${name}: ${call}`);
+  }
+  assert.equal(CONDUITS.filter((name) => TRAITS[name].fundsKeys).length, 1, "one treasury funds both keys");
 });

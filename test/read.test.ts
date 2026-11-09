@@ -1,17 +1,19 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import type { Address } from "viem";
+import { ContractFunctionExecutionError, ContractFunctionRevertedError, type Address } from "viem";
+import { immutableAbi } from "../src/abi.ts";
 import { now, readMany, WEEK, type Chain, type Client } from "../src/chain.ts";
 import { readEpoch, readRewards, readVotes } from "../src/read.ts";
+import { conduitsOf } from "./helpers.ts";
 
 const addr = (n: number) => `0x${n.toString(16).padStart(40, "0")}` as Address;
-const [VOTER, CONDUIT, VE] = [addr(1), addr(2), addr(97)] as const;
+const [VOTER, KLIMA, VE] = [addr(1), addr(2), addr(97)] as const;
 const [POOL_A, POOL_B, POOL_C, POOL_D] = [addr(3), addr(4), addr(5), addr(15)] as const;
 const [GAUGE_A, GAUGE_B, GAUGE_C, GAUGE_D] = [addr(6), addr(7), addr(16), addr(17)] as const;
 const [EXT_A, INT_A, EXT_B, INT_B] = [addr(8), addr(9), addr(10), addr(11)] as const;
 const [EXT_C, INT_C, EXT_D, INT_D] = [addr(18), addr(19), addr(20), addr(21)] as const;
 const [TOK_1, TOK_2, TOK_3] = [addr(12), addr(13), addr(14)] as const;
-const V2 = addr(22);
+const IMMUTABLE = addr(22);
 
 type Call = { address: Address; functionName: string; args?: readonly unknown[] };
 
@@ -20,23 +22,42 @@ const blockTags: unknown[] = [];
 
 function fakeChain(answer: (call: Call) => unknown): Chain {
   const client = {
-    multicall: async ({ contracts, blockTag }: { contracts: Call[]; blockTag?: string }) => {
+    multicall: async ({
+      contracts,
+      blockTag,
+      allowFailure,
+    }: {
+      contracts: Call[];
+      blockTag?: string;
+      allowFailure: boolean;
+    }) => {
       multicalls++;
       blockTags.push(blockTag);
-      return contracts.map(answer);
+      if (!allowFailure) return contracts.map(answer);
+      return contracts.map((c) => {
+        try {
+          return { status: "success", result: answer(c) };
+        } catch (error) {
+          return { status: "failure", error };
+        }
+      });
     },
   } as unknown as Client;
   const broadcast = async () => assert.fail("reads never send");
   return {
     client,
     bulk: client,
-    v2Client: client,
     broadcast,
-    module: addr(99),
-    conduit: CONDUIT,
-    keeper: addr(98),
+    known: async () => false,
     voter: VOTER,
     ve: VE,
+    conduits: conduitsOf(
+      {
+        klima: { address: KLIMA, from: addr(98), module: addr(99) },
+        immutable: { address: IMMUTABLE, from: addr(23) },
+      },
+      client,
+    ),
   };
 }
 
@@ -55,8 +76,10 @@ const internalBribes: Record<string, Address> = {
   [GAUGE_D]: INT_D,
 };
 const weights: Record<string, bigint> = { [POOL_A]: 1000n, [POOL_B]: 500n };
-const ownVotes: Record<string, bigint> = { [POOL_A]: 100n, [POOL_B]: 0n };
-const v2Votes: Record<string, bigint> = { [POOL_A]: 40n, [POOL_B]: 0n };
+const votesOf: Record<string, Record<string, bigint>> = {
+  [KLIMA]: { [POOL_A]: 100n, [POOL_B]: 0n },
+  [IMMUTABLE]: { [POOL_A]: 40n, [POOL_B]: 0n },
+};
 const rewardTokens: Record<string, Address[]> = {
   [EXT_A]: [TOK_1, TOK_2],
   [INT_A]: [],
@@ -66,21 +89,28 @@ const rewardTokens: Record<string, Address[]> = {
   [INT_D]: [],
 };
 const amounts: Record<string, bigint> = { [EXT_A + TOK_1]: 7n, [EXT_A + TOK_2]: 0n, [INT_B + TOK_1]: 3n };
-const voterState = { start: 1000n, lastVoted: 1000n, v2LastVoted: 1000n };
+const voterState = { start: 1000n, lastVoted: { [KLIMA]: 1000n, [IMMUTABLE]: 1000n } as Record<string, bigint> };
+const E = 10n ** 18n;
+let scoring: "yes" | "reverts" = "yes";
+const reverted = ({ address, functionName }: Call) =>
+  new ContractFunctionExecutionError(
+    new ContractFunctionRevertedError({ abi: immutableAbi, functionName, message: "execution reverted" }),
+    { abi: [], contractAddress: address, functionName },
+  );
 let calendarAt: unknown;
 
 function table({ address, functionName, args = [] }: Call): unknown {
   const arg = args[0] as string;
   if (address === VE && functionName === "getPastVotes") {
     calendarAt = args[1];
-    return arg === V2 ? 7n : 10n;
+    return arg === IMMUTABLE ? 7n : 10n;
   }
   if (address === VOTER) {
     switch (functionName) {
       case "_epochTimestamp":
         return voterState.start;
       case "lastVoted":
-        return arg === V2 ? voterState.v2LastVoted : voterState.lastVoted;
+        return voterState.lastVoted[arg];
       case "length":
         return BigInt(pools.length);
       case "pools":
@@ -96,7 +126,7 @@ function table({ address, functionName, args = [] }: Call): unknown {
       case "weights":
         return weights[arg];
       case "votes":
-        return (arg === V2 ? v2Votes : ownVotes)[args[1] as string];
+        return votesOf[arg]![args[1] as string];
     }
   }
   if (functionName === "rewardsListLength") return BigInt(rewardTokens[address]!.length);
@@ -106,10 +136,21 @@ function table({ address, functionName, args = [] }: Call): unknown {
     return [1000n, amounts[address + arg], 0n];
   }
   if (functionName === "decimals") return address === TOK_1 ? 6 : 18;
+  if (address === IMMUTABLE && functionName === "currentScore") {
+    if (scoring === "reverts") throw reverted({ address, functionName });
+    return 5n * E;
+  }
   throw new Error(`unexpected call ${functionName} on ${address}`);
 }
 
-const epoch = { start: 1000n, flip: 1000n + WEEK, power: 10n, lastVoted: 1000n, votedThisEpoch: true };
+const epoch = {
+  start: 1000n,
+  flip: 1000n + WEEK,
+  votes: {
+    klima: { power: 10n, lastVoted: 1000n, votedThisEpoch: true },
+    immutable: { power: 7n, lastVoted: 1000n, votedThisEpoch: true },
+  },
+};
 
 test("readRewards keeps the pools with live gauges and rewards in whitelisted tokens, and those rewards alone", async () => {
   const rewards = await readRewards(fakeChain(table), [TOK_1, TOK_2]);
@@ -119,66 +160,69 @@ test("readRewards keeps the pools with live gauges and rewards in whitelisted to
   ]);
 });
 
-test("readVotes reads the epoch and the votes on each pool, in one multicall for up to 498 pools", async () => {
+test("readVotes reads the epoch and both conduits' votes on each pool, in one multicall for up to 331 pools", async () => {
   const chain = fakeChain(table);
   const rewards = await readRewards(chain, [TOK_1]);
   multicalls = 0;
   assert.deepEqual(await readVotes(chain, rewards), {
     epoch,
     pools: [
-      { ...rewards[0]!, otherVotes: 900n, ownVotes: 100n, v2Votes: 0n },
-      { ...rewards[1]!, otherVotes: 500n, ownVotes: 0n, v2Votes: 0n },
+      { ...rewards[0]!, weight: 1000n, votes: { klima: 100n, immutable: 40n } },
+      { ...rewards[1]!, weight: 500n, votes: { klima: 0n, immutable: 0n } },
     ],
-  });
-  await readVotes(chain, Array<(typeof rewards)[number]>(498).fill(rewards[0]!));
-  assert.equal(multicalls, 2);
-  assert.deepEqual(await readMany(chain.client, []), []);
-  assert.equal(multicalls, 2, "no calls make no request");
-  voterState.lastVoted = 999n;
-  try {
-    const { epoch: stale, pools } = await readVotes(chain, rewards);
-    assert.equal(stale.votedThisEpoch, false);
-    assert.deepEqual(
-      [pools[0]!.otherVotes, pools[0]!.ownVotes],
-      [1000n, 0n],
-      "last epoch's own votes are neither subtracted nor counted",
-    );
-  } finally {
-    voterState.lastVoted = 1000n;
-  }
-});
-
-test("with the immutable conduit, readVotes also reads its votes and power, in one multicall for up to 331 pools", async () => {
-  const chain = { ...fakeChain(table), v2: { conduit: V2, proposer: addr(23), priced: [] } };
-  const rewards = await readRewards(chain, [TOK_1]);
-  multicalls = 0;
-  const v2 = { power: 7n, lastVoted: 1000n, votedThisEpoch: true };
-  assert.deepEqual(await readVotes(chain, rewards), {
-    epoch: { ...epoch, v2 },
-    pools: [
-      { ...rewards[0]!, otherVotes: 900n, ownVotes: 100n, v2Votes: 40n },
-      { ...rewards[1]!, otherVotes: 500n, ownVotes: 0n, v2Votes: 0n },
-    ],
+    scores: { immutable: 5n * E },
   });
   await readVotes(chain, Array<(typeof rewards)[number]>(331).fill(rewards[0]!));
   assert.equal(multicalls, 2);
-  assert.deepEqual(await readEpoch(chain), { ...epoch, v2 });
-  voterState.v2LastVoted = 999n;
-  try {
-    const { epoch: stale, pools } = await readVotes(chain, rewards);
-    assert.deepEqual(stale.v2, { power: 7n, lastVoted: 999n, votedThisEpoch: false });
-    assert.equal(pools[0]!.v2Votes, 0n, "last epoch's votes of the immutable conduit do not count");
-  } finally {
-    voterState.v2LastVoted = 1000n;
+  assert.deepEqual(await readMany(chain.client, []), []);
+  assert.equal(multicalls, 2, "no calls make no request");
+});
+
+test("each conduit's votes count only once it voted this epoch", async () => {
+  const chain = fakeChain(table);
+  const rewards = await readRewards(chain, [TOK_1]);
+  for (const [name, address, power] of [
+    ["klima", KLIMA, 10n],
+    ["immutable", IMMUTABLE, 7n],
+  ] as const) {
+    voterState.lastVoted[address] = 999n;
+    try {
+      const { epoch: stale, pools } = await readVotes(chain, rewards);
+      assert.deepEqual(stale.votes[name], { power, lastVoted: 999n, votedThisEpoch: false });
+      assert.equal(pools[0]!.votes[name], 0n, `last epoch's votes of ${name} do not count`);
+      assert.equal(pools[0]!.weight, 1000n, "the pool's weight is as it is");
+    } finally {
+      voterState.lastVoted[address] = 1000n;
+    }
   }
 });
 
-test("asked for the block being built, readVotes reads it", async () => {
+test("the immutable conduit's score is read with the votes, and left out while it reverts, unlike any vote", async () => {
+  const chain = fakeChain(table);
+  const rewards = await readRewards(chain, [TOK_1]);
+  multicalls = 0;
+  scoring = "reverts";
+  try {
+    const state = await readVotes(chain, rewards);
+    assert.deepEqual(state.scores, {});
+    assert.equal(state.pools[0]!.votes.immutable, 40n);
+    assert.equal(multicalls, 1);
+  } finally {
+    scoring = "yes";
+  }
+  const votesRevert = fakeChain((call) => {
+    if (call.functionName === "weights") throw reverted(call);
+    return table(call);
+  });
+  await assert.rejects(readVotes(votesRevert, rewards), /weights reverted/);
+});
+
+test("readVotes reads the latest block", async () => {
   const chain = fakeChain(table);
   const rewards = await readRewards(chain, [TOK_1]);
   blockTags.length = 0;
-  await readVotes(chain, rewards, "pending");
-  assert.deepEqual(blockTags, ["pending"]);
+  await readVotes(chain, rewards);
+  assert.deepEqual(blockTags, [undefined]);
 });
 
 test("readEpoch reads the epoch and the power at the calendar epoch in one round trip", async (t) => {
